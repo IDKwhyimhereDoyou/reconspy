@@ -218,30 +218,7 @@ local function log(msg, color)
 	print("[ActionSpy] " .. tostring(msg))
 end
 
-local function argBits(...)
-	local n = select("#", ...)
-	local bits = {}
-	for i = 1, math.min(n, 5) do
-		local v = select(i, ...)
-		local t = typeof(v)
-		if t == "string" then
-			bits[#bits + 1] = trunc(string.format("%q", v), 24)
-		elseif t == "Instance" then
-			bits[#bits + 1] = v.Name
-		else
-			bits[#bits + 1] = trunc(tostring(v), 20)
-		end
-	end
-	if n > 5 then
-		bits[#bits + 1] = "+" .. tostring(n - 5)
-	end
-	return table.concat(bits, ", "), n
-end
-
 local function refreshList()
-	if not listFrame then
-		return
-	end
 	for _, ch in ipairs(listFrame:GetChildren()) do
 		if ch:IsA("TextLabel") then
 			ch:Destroy()
@@ -274,33 +251,70 @@ local function refreshList()
 	end
 end
 
-local function pushEvent(remote, method, inbound, ...)
+local function later(fn)
+	if type(task) == "table" and type(task.defer) == "function" then
+		task.defer(fn)
+	elseif type(task) == "table" and type(task.spawn) == "function" then
+		task.spawn(fn)
+	else
+		spawn(fn)
+	end
+end
+
+local function packSelect(...)
+	local n = select("#", ...)
+	local packed = { n = n }
+	for i = 1, n do
+		packed[i] = select(i, ...)
+	end
+	return packed
+end
+
+local function addCaptured(remote, method, inbound, packed)
 	if S.replaying or S.stopped or not S.recording or not S.live then
 		return
 	end
 	if typeof(remote) ~= "Instance" then
 		return
 	end
-	if isNoisy(remote.Name) then
+	local name = ""
+	pcall(function()
+		name = remote.Name
+	end)
+	if isNoisy(name) then
 		return
 	end
 	local now = os.clock()
 	if S.t0 == 0 then
 		S.t0 = now
 	end
-	local n = select("#", ...)
-	local packed = { n = n }
-	for i = 1, n do
-		packed[i] = select(i, ...)
+	local path = name
+	pcall(function()
+		path = remote:GetFullName()
+	end)
+	local n = packed.n or 0
+	local bits = {}
+	for i = 1, math.min(n, 5) do
+		local v = packed[i]
+		local t = typeof(v)
+		if t == "string" then
+			bits[#bits + 1] = trunc(string.format("%q", v), 24)
+		elseif t == "Instance" then
+			bits[#bits + 1] = v.Name
+		else
+			bits[#bits + 1] = trunc(tostring(v), 20)
+		end
 	end
-	local summary, argc = argBits(...)
+	if n > 5 then
+		bits[#bits + 1] = "+" .. tostring(n - 5)
+	end
 	local ev = {
 		delay = now - S.t0,
 		method = method,
 		inbound = inbound and true or false,
 		remote = remote,
-		name = remote.Name,
-		path = remote:GetFullName(),
+		name = name,
+		path = path,
 		className = remote.ClassName,
 		packed = packed,
 		label = string.format(
@@ -308,108 +322,73 @@ local function pushEvent(remote, method, inbound, ...)
 			now - S.t0,
 			inbound and "←" or "→",
 			method,
-			remote.Name,
-			argc,
-			summary
+			name,
+			n,
+			table.concat(bits, ", ")
 		),
 	}
 	S.live.events[#S.live.events + 1] = ev
 	refreshList()
-	log((inbound and "← " or "→ ") .. method .. "  " .. remote.Name, inbound and THEME.IN or THEME.TEXT)
+	log((inbound and "← " or "→ ") .. method .. "  " .. name, inbound and THEME.IN or THEME.TEXT)
 end
 
-local function onOutgoing(self, pretty, ...)
-	if pretty == "FireServer" then
-		if not self:IsA("RemoteEvent") and not self:IsA("UnreliableRemoteEvent") then
-			return
-		end
-	elseif pretty == "InvokeServer" then
-		if not self:IsA("RemoteFunction") then
-			return
-		end
-	else
-		return
-	end
-	pushEvent(self, pretty, false, ...)
+local function noteOutgoing(self, pretty, packed)
+	later(function()
+		addCaptured(self, pretty, false, packed)
+	end)
 end
 
 local function hookNamecall()
+	if S.oldNamecall then
+		return true
+	end
 	local getncm = pickFn("getnamecallmethod", "get_namecall_method")
 	local hook = pickFn("hookmetamethod")
 	if type(hook) ~= "function" or type(getncm) ~= "function" then
 		return false
 	end
 	local box = { old = nil }
-	local handler = wrapC(function(self, ...)
-		local okM, m = pcall(getncm)
-		if okM then
-			local low = string.lower(tostring(m or ""))
-			if low == "fireserver" then
-				pcall(onOutgoing, self, "FireServer", ...)
-			elseif low == "invokeserver" then
-				pcall(onOutgoing, self, "InvokeServer", ...)
+	local function raw(self, ...)
+		if S.recording and not S.replaying and not S.stopped then
+			local okM, m = pcall(getncm)
+			if okM then
+				local low = string.lower(tostring(m or ""))
+				if low == "fireserver" or low == "invokeserver" then
+					pcall(noteOutgoing, self, low == "fireserver" and "FireServer" or "InvokeServer", packSelect(...))
+				end
 			end
 		end
-		return box.old(self, ...)
+		local orig = box.old
+		if type(orig) ~= "function" then
+			return
+		end
+		return orig(self, ...)
+	end
+	local ok, ret = pcall(function()
+		return hook(game, "__namecall", raw)
 	end)
-	local ok, old = pcall(hook, game, "__namecall", handler)
-	if ok and type(old) == "function" then
-		box.old = old
+	if not ok or type(ret) ~= "function" then
+		ok, ret = pcall(function()
+			return hook(game, "__namecall", wrapC(raw))
+		end)
+	end
+	if ok and type(ret) == "function" then
+		box.old = ret
+		S.oldNamecall = ret
 		return true
 	end
 	return false
-end
-
-local function hookMethods()
-	local hf = pickFn("hookfunction", "hookfunc", "replaceclosure", "detour")
-	if type(hf) ~= "function" then
-		return false
-	end
-	local hooked = false
-	local function hookClass(className, methodName, pretty)
-		local okD, dummy = pcall(Instance.new, className)
-		if not okD or typeof(dummy) ~= "Instance" then
-			return
-		end
-		local meth = dummy[methodName]
-		pcall(dummy.Destroy, dummy)
-		if type(meth) ~= "function" then
-			return
-		end
-		local box = { old = nil }
-		local ok, old = pcall(function()
-			return hf(
-				meth,
-				wrapC(function(self, ...)
-					pcall(onOutgoing, self, pretty, ...)
-					return box.old(self, ...)
-				end)
-			)
-		end)
-		if ok and type(old) == "function" then
-			box.old = old
-			hooked = true
-		end
-	end
-	pcall(hookClass, "RemoteEvent", "FireServer", "FireServer")
-	pcall(hookClass, "RemoteFunction", "InvokeServer", "InvokeServer")
-	pcall(function()
-		hookClass("UnreliableRemoteEvent", "FireServer", "FireServer")
-	end)
-	return hooked
 end
 
 local function ensureHook()
 	if S.spyHooked then
 		return true, "ok"
 	end
-	local a = hookNamecall()
-	local b = hookMethods()
-	if a or b then
+	if hookNamecall() then
 		S.spyHooked = true
-		return true, (a and "namecall" or "") .. ((a and b) and "+" or "") .. (b and "method" or "")
+		return true, "namecall"
 	end
-	return false, "this executor cannot hook remotes"
+	return false, "this executor cannot hook remotes without breaking them (no hookmetamethod)"
 end
 
 local function stopInbound()
@@ -436,9 +415,14 @@ local function startInbound()
 		end
 		local ok, conn = pcall(function()
 			return inst.OnClientEvent:Connect(function(...)
-				if S.recording then
-					pushEvent(inst, "OnClientEvent", true, ...)
+				if not S.recording then
+					return
 				end
+				local packed = packSelect(...)
+				local remote = inst
+				later(function()
+					addCaptured(remote, "OnClientEvent", true, packed)
+				end)
 			end)
 		end)
 		if ok and conn then
@@ -480,13 +464,13 @@ local function startRecord()
 	S.recording = true
 	S.t0 = 0
 	S.live = { events = {} }
-	startInbound()
 	if recBtn then
 		recBtn.Text = "Stop"
 		recBtn.BackgroundColor3 = THEME.ERR
 	end
 	refreshList()
 	log("Listening (" .. tostring(how) .. "). Do the action, then press Record again to save.", THEME.OK)
+	later(startInbound)
 end
 
 local function stopRecord()
