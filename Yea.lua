@@ -58,20 +58,23 @@ local S = {
 	listFilter = "",
 	minimized = false,
 	listW = 280,
+	inspectOpen = false,
+	inspectW = 250,
 }
 
 local LINE_H = 18
-local noteData = { "-- record, then stop.", "-- Click a line to edit. Enter = new line. Empty + Backspace = delete." }
+local noteData = { "-- record, then stop.", "-- Click a line to edit. Enter = new line. Empty line + Backspace = delete." }
 local editSlot = 1
 local noteRowFrames = {}
 local noteBusy = false
 
 local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, noteScroll, argLab
 local repeatBox, gapBox, waitAllBox, filterBox, statusLab, listHold, noteHold, splitBar
-local f10Conn, dragConn, dragBegan, dragEnded
+local inspHold, inspArrow, inspBody, inspHead
+local f10Conn, dragConn, dragBegan, dragEnded, noteKeyConn
 local dragging, dragStart, startPos
 local resizing, resizeStart, startSize, splitting, splitStart, splitW
-local rebuildNote, layoutPanels, markPlayLine
+local rebuildNote, layoutPanels, markPlayLine, showInspect, tryDeleteEmptyLine
 local btnBase = {}
 
 local function envGet(name)
@@ -474,6 +477,89 @@ local function luaArgs(packed)
 	return table.concat(parts, ", ")
 end
 
+local function pathToLua(full)
+	full = tostring(full or "")
+	if full == "" then
+		return "nil"
+	end
+	local s = "game"
+	for part in string.gmatch(full, "[^.]+") do
+		if string.match(part, "^[%a_][%w_]*$") then
+			s = s .. "." .. part
+		else
+			s = s .. ":FindFirstChild(" .. string.format("%q", part) .. ")"
+		end
+	end
+	return s
+end
+
+local function remotePath(ev)
+	if not ev then
+		return "?"
+	end
+	if isInst(ev.remote) then
+		local ok, full = pcall(function()
+			return ev.remote:GetFullName()
+		end)
+		if ok and full and full ~= "" then
+			return full
+		end
+	end
+	local p = tostring(ev.path or "")
+	if p ~= "" and string.find(p, ".", 1, true) then
+		return p
+	end
+	return tostring(ev.name or "?")
+end
+
+local function remoteClass(ev)
+	if not ev then
+		return "?"
+	end
+	if ev.className and ev.className ~= "" then
+		return tostring(ev.className)
+	end
+	if isInst(ev.remote) then
+		local ok, c = pcall(function()
+			return ev.remote.ClassName
+		end)
+		if ok and c then
+			return tostring(c)
+		end
+	end
+	return "?"
+end
+
+local function eventSnippet(ev)
+	if not ev then
+		return "-- nothing selected"
+	end
+	local path = remotePath(ev)
+	local className = remoteClass(ev)
+	local args = luaArgs(ev.packed)
+	if args == "" then
+		args = ""
+	end
+	local dir = ev.inbound and "game → you (inbound)" or "you → game (outbound)"
+	local method = tostring(ev.method or (ev.inbound and "OnClientEvent" or "FireServer"))
+	local lines = {
+		"-- Explorer path",
+		"-- " .. path,
+		"-- Class: " .. className,
+		"-- " .. dir,
+		"-- Method: " .. method,
+		"",
+	}
+	if ev.inbound then
+		lines[#lines + 1] = "-- received args:"
+		lines[#lines + 1] = args ~= "" and ("-- " .. args) or "-- (none)"
+	else
+		local call = pathToLua(path) .. ":" .. method .. "(" .. args .. ")"
+		lines[#lines + 1] = call
+	end
+	return table.concat(lines, "\n")
+end
+
 local function pause(sec)
 	sec = tonumber(sec) or 0
 	if sec < 0 then
@@ -769,6 +855,50 @@ local function setNoteText(text)
 	end
 end
 
+tryDeleteEmptyLine = function()
+	if noteBusy then
+		return false
+	end
+	if not noteBox or not noteBox.Parent then
+		return false
+	end
+	local focused = false
+	pcall(function()
+		focused = noteBox:IsFocused()
+	end)
+	if not focused then
+		return false
+	end
+	local text = tostring(noteBox.Text or "")
+	if text ~= "" then
+		return false
+	end
+	local idx = editSlot or S.editIndex
+	if type(idx) ~= "number" or idx < 1 or idx > #noteData then
+		return false
+	end
+	if #noteData <= 1 then
+		noteData[1] = ""
+		noteBox.Text = ""
+		return true
+	end
+	noteBusy = true
+	table.remove(noteData, idx)
+	if S.editIndex > #noteData then
+		S.editIndex = #noteData
+	elseif idx > 1 and S.editIndex >= idx then
+		S.editIndex = idx - 1
+	else
+		S.editIndex = math.min(idx, #noteData)
+	end
+	if rebuildNote then
+		rebuildNote(true)
+	else
+		noteBusy = false
+	end
+	return true
+end
+
 local function cursorLine()
 	return S.editIndex or 1
 end
@@ -831,46 +961,100 @@ local function previewArgs()
 	if not idx then
 		argLab.Text = "  click a line · Enter new line · empty Backspace deletes"
 		argLab.TextColor3 = THEME.DIM
+		if showInspect then
+			showInspect(nil, "Click a notepad line or a recorded event.")
+		end
 		return
 	end
 	local step = steps[idx]
 	if step.kind == "wait" then
 		argLab.Text = string.format("  wait(%.2f)", step.t or 0)
 		argLab.TextColor3 = THEME.WARN
+		if showInspect then
+			showInspect(nil, string.format("-- wait\nwait(%.2f)", step.t or 0))
+		end
 		return
 	end
 	if step.inbound then
 		argLab.Text = "  in " .. tostring(step.name) .. "  (game → you, Start skips this)"
 		argLab.TextColor3 = THEME.IN
-		return
 	end
 	local take = S.saved
 	if not take then
-		argLab.Text = "  out " .. tostring(step.name) .. "  (record first to capture args)"
-		argLab.TextColor3 = THEME.OUT
+		if not step.inbound then
+			argLab.Text = "  out " .. tostring(step.name) .. "  (record first to capture args)"
+			argLab.TextColor3 = THEME.OUT
+		end
+		if showInspect then
+			showInspect(nil, "-- no recording saved yet\n-- " .. tostring(step.name))
+		end
 		return
 	end
 	local used = {}
 	for i = 1, idx - 1 do
-		if steps[i].kind == "fire" and not steps[i].inbound then
-			claimEvent(take, used, steps[i].name, false)
+		if steps[i].kind == "fire" then
+			local wantIn = steps[i].inbound and true or false
+			if wantIn == (step.inbound and true or false) then
+				claimEvent(take, used, steps[i].name, wantIn)
+			end
 		end
 	end
-	local ev = claimEvent(take, used, step.name, false)
+	local ev = claimEvent(take, used, step.name, step.inbound and true or false)
 	if not ev then
-		argLab.Text = "  out " .. tostring(step.name) .. "  (no saved args)"
-		argLab.TextColor3 = THEME.ERR
+		if not step.inbound then
+			argLab.Text = "  out " .. tostring(step.name) .. "  (no saved args)"
+			argLab.TextColor3 = THEME.ERR
+		end
+		if showInspect then
+			showInspect(nil, "-- no matching recorded event for\n-- " .. tostring(step.name))
+		end
 		return
 	end
-	local shown = luaArgs(ev.packed)
-	if shown == "" then
-		shown = "no args"
+	if not step.inbound then
+		local shown = luaArgs(ev.packed)
+		if shown == "" then
+			shown = "no args"
+		end
+		argLab.Text = trunc(
+			"  " .. tostring(ev.method or "FireServer") .. "  " .. tostring(step.name) .. "(" .. shown .. ")",
+			240
+		)
+		argLab.TextColor3 = THEME.OUT
 	end
-	argLab.Text = trunc(
-		"  " .. tostring(ev.method or "FireServer") .. "  " .. tostring(step.name) .. "(" .. shown .. ")",
-		240
-	)
-	argLab.TextColor3 = THEME.OUT
+	if showInspect then
+		showInspect(ev)
+	end
+end
+
+showInspect = function(ev, fallback)
+	if not inspBody then
+		return
+	end
+	local text
+	if ev then
+		text = eventSnippet(ev)
+		if inspHead then
+			inspHead.Text = trunc((ev.inbound and "in  " or "out  ") .. tostring(ev.name or "Remote"), 40)
+			inspHead.TextColor3 = ev.inbound and THEME.IN or THEME.OUT
+		end
+		if not S.inspectOpen and inspHold then
+			S.inspectOpen = true
+			inspHold.Visible = true
+			if inspArrow then
+				inspArrow.Text = "›"
+			end
+			if layoutPanels then
+				layoutPanels()
+			end
+		end
+	else
+		text = tostring(fallback or "-- click a recorded event or a notepad line")
+		if inspHead then
+			inspHead.Text = "Inspector"
+			inspHead.TextColor3 = THEME.DIM
+		end
+	end
+	inspBody.Text = text
 end
 
 markPlayLine = function(line)
@@ -967,6 +1151,9 @@ local function refreshList()
 				else
 					S.selected = { [key] = true }
 					jumpNoteToKey(key)
+					if showInspect then
+						showInspect(ev)
+					end
 				end
 				refreshList()
 			end)
@@ -1099,8 +1286,12 @@ local function addCaptured(remote, method, inbound, packed)
 		return
 	end
 	local name = ""
+	local path = ""
+	local className = ""
 	pcall(function()
 		name = remote.Name
+		path = remote:GetFullName()
+		className = remote.ClassName
 	end)
 	if isNoisy(name) or tooFast(name) then
 		return
@@ -1115,7 +1306,8 @@ local function addCaptured(remote, method, inbound, packed)
 		inbound = inbound and true or false,
 		remote = remote,
 		name = name,
-		path = name,
+		path = (path ~= "" and path) or name,
+		className = className,
 		packed = packed,
 		label = string.format("+%.2fs  %s  %s", now - S.t0, inbound and "in" or "out", name),
 	}
@@ -1287,6 +1479,7 @@ local function stopRecord()
 			pcall(function()
 				if isInst(ev.remote) then
 					ev.path = ev.remote:GetFullName()
+					ev.className = ev.remote.ClassName
 				end
 			end)
 		end
@@ -1818,7 +2011,17 @@ local function destroyGui()
 			dragEnded:Disconnect()
 		end)
 	end
+	if noteKeyConn then
+		pcall(function()
+			noteKeyConn:Disconnect()
+		end)
+		noteKeyConn = nil
+	end
 	logLabel = nil
+	inspBody = nil
+	inspHead = nil
+	inspHold = nil
+	inspArrow = nil
 	if gui then
 		pcall(function()
 			gui:Destroy()
@@ -2174,16 +2377,110 @@ local function createGui()
 	corner(noteHold, 8)
 	stroke(noteHold, THEME.STROKE, 1)
 
+	inspArrow = Instance.new("TextButton")
+	inspArrow.AutoButtonColor = false
+	inspArrow.Text = "‹"
+	inspArrow.Font = Enum.Font.GothamBold
+	inspArrow.TextSize = 16
+	inspArrow.TextColor3 = THEME.TEXT
+	inspArrow.BackgroundColor3 = THEME.BTN
+	inspArrow.BorderSizePixel = 0
+	inspArrow.ZIndex = 5
+	inspArrow.Parent = win
+	corner(inspArrow, 6)
+	btnBase[inspArrow] = THEME.BTN
+	addPressAnim(inspArrow)
+	inspArrow.MouseEnter:Connect(function()
+		tween(inspArrow, { BackgroundColor3 = THEME.HOVER }, 0.1)
+	end)
+	inspArrow.MouseLeave:Connect(function()
+		tween(inspArrow, { BackgroundColor3 = btnBase[inspArrow] or THEME.BTN }, 0.12)
+	end)
+
+	inspHold = Instance.new("Frame")
+	inspHold.BackgroundColor3 = THEME.PANEL
+	inspHold.BorderSizePixel = 0
+	inspHold.Visible = false
+	inspHold.ClipsDescendants = true
+	inspHold.Parent = win
+	corner(inspHold, 8)
+	stroke(inspHold, THEME.STROKE, 1)
+
+	inspHead = Instance.new("TextLabel")
+	inspHead.BackgroundTransparency = 1
+	inspHead.Position = UDim2.fromOffset(8, 4)
+	inspHead.Size = UDim2.new(1, -16, 0, 20)
+	inspHead.Font = Enum.Font.GothamMedium
+	inspHead.TextSize = 12
+	inspHead.TextXAlignment = Enum.TextXAlignment.Left
+	inspHead.TextColor3 = THEME.DIM
+	inspHead.Text = "Inspector"
+	inspHead.Parent = inspHold
+
+	local inspScroll = Instance.new("ScrollingFrame")
+	inspScroll.Position = UDim2.fromOffset(4, 26)
+	inspScroll.Size = UDim2.new(1, -8, 1, -32)
+	inspScroll.BackgroundTransparency = 1
+	inspScroll.BorderSizePixel = 0
+	inspScroll.ScrollBarThickness = 4
+	inspScroll.ScrollBarImageColor3 = THEME.DIM
+	inspScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	inspScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	inspScroll.Parent = inspHold
+
+	inspBody = Instance.new("TextBox")
+	inspBody.Size = UDim2.new(1, -6, 0, 0)
+	inspBody.AutomaticSize = Enum.AutomaticSize.Y
+	inspBody.BackgroundTransparency = 1
+	inspBody.BorderSizePixel = 0
+	inspBody.ClearTextOnFocus = false
+	inspBody.TextEditable = false
+	inspBody.MultiLine = true
+	inspBody.TextWrapped = true
+	inspBody.TextXAlignment = Enum.TextXAlignment.Left
+	inspBody.TextYAlignment = Enum.TextYAlignment.Top
+	inspBody.Font = Enum.Font.Code
+	inspBody.TextSize = 12
+	inspBody.TextColor3 = THEME.TEXT
+	inspBody.Text = "-- click a recorded event\n-- or a notepad line"
+	inspBody.Parent = inspScroll
+
+	local function setInspectOpen(open)
+		S.inspectOpen = open and true or false
+		inspHold.Visible = S.inspectOpen
+		inspArrow.Text = S.inspectOpen and "›" or "‹"
+		if layoutPanels then
+			layoutPanels()
+		end
+	end
+	inspArrow.MouseButton1Click:Connect(function()
+		setInspectOpen(not S.inspectOpen)
+	end)
+
 	layoutPanels = function()
 		local lw = S.listW or 280
+		local arrowW = 18
+		local gap = 8
+		local iw = S.inspectOpen and (S.inspectW or 250) or 0
+		local rightPad = 12 + arrowW + (S.inspectOpen and (gap + iw) or 0)
 		listHold.Position = UDim2.fromOffset(12, 128)
 		listHold.Size = UDim2.new(0, lw, 1, -180)
 		splitBar.Position = UDim2.fromOffset(12 + lw + 1, 140)
 		splitBar.Size = UDim2.new(0, 6, 1, -204)
 		noteHold.Position = UDim2.fromOffset(12 + lw + 10, 128)
-		noteHold.Size = UDim2.new(1, -(12 + lw + 10 + 12), 1, -180)
+		noteHold.Size = UDim2.new(1, -(12 + lw + 10 + rightPad), 1, -180)
+		if S.inspectOpen then
+			inspHold.Position = UDim2.new(1, -(12 + iw), 0, 128)
+			inspHold.Size = UDim2.fromOffset(iw, 0)
+			inspHold.Size = UDim2.new(0, iw, 1, -180)
+			inspArrow.Position = UDim2.new(1, -(12 + iw + gap + arrowW), 0, 128)
+		else
+			inspArrow.Position = UDim2.new(1, -(12 + arrowW), 0, 128)
+		end
+		inspArrow.Size = UDim2.new(0, arrowW, 1, -180)
 	end
 	layoutPanels()
+	setInspectOpen(false)
 
 	noteScroll = Instance.new("ScrollingFrame")
 	noteScroll.Position = UDim2.fromOffset(4, 4)
@@ -2347,16 +2644,6 @@ local function createGui()
 						S.editIndex = S.editIndex + 1
 						rebuildNote(true)
 					end
-				elseif input.KeyCode == Enum.KeyCode.Backspace then
-					if box.Text == "" and #noteData > 1 then
-						table.remove(noteData, idx)
-						if S.editIndex > #noteData then
-							S.editIndex = #noteData
-						elseif idx > 1 then
-							S.editIndex = idx - 1
-						end
-						rebuildNote(true)
-					end
 				end
 			end)
 		end
@@ -2458,6 +2745,17 @@ local function boot()
 	end
 	createGui()
 	refreshList()
+	if showInspect then
+		showInspect(nil, "-- click a recorded event\n-- or a notepad line")
+	end
+	noteKeyConn = UIS.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.Keyboard then
+			return
+		end
+		if input.KeyCode == Enum.KeyCode.Backspace or input.KeyCode == Enum.KeyCode.Delete then
+			tryDeleteEmptyLine()
+		end
+	end)
 	f10Conn = UIS.InputBegan:Connect(function(input)
 		if input.KeyCode == Enum.KeyCode.F10 then
 			destroyGui()
