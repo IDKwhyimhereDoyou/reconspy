@@ -290,24 +290,21 @@ local function parseNote(text)
 			if w then
 				steps[#steps + 1] = { kind = "wait", t = tonumber(w) or 0 }
 			else
-				local side, inner = string.match(t, "^([Ii][Nn]|[Oo][Uu][Tt])%s+[Ff][Ii][Rr][Ee]%s*%((.-)%)")
-				if not inner then
-					inner = string.match(t, "^[Ff][Ii][Rr][Ee]%s*%((.-)%)")
-				end
+				local inner = string.match(t, "[Ff][Ii][Rr][Ee]%s*%(%s*(.-)%s*%)")
 				if inner then
 					local name = parseNameToken(inner)
 					local low = string.lower(t)
 					local inbound = false
-					if side and string.lower(side) == "in" then
+					if string.match(low, "^in[%s%p]") or string.match(low, "^in$") then
 						inbound = true
 					end
-					if string.find(low, "inbound", 1, true) or string.find(low, "-- client", 1, true) then
-						inbound = true
-					end
-					if side and string.lower(side) == "out" then
+					if string.match(low, "^out[%s%p]") then
 						inbound = false
 					end
-					if string.find(low, "outbound", 1, true) or string.find(low, "-- server", 1, true) then
+					if string.find(low, "%-%-%s*inbound", 1, false) then
+						inbound = true
+					end
+					if string.find(low, "%-%-%s*outbound", 1, false) then
 						inbound = false
 					end
 					steps[#steps + 1] = {
@@ -323,14 +320,23 @@ local function parseNote(text)
 	return steps
 end
 
+local function namesEqual(a, b)
+	return string.lower(tostring(a or "")) == string.lower(tostring(b or ""))
+end
+
 local function claimEvent(take, used, name, inbound)
 	if not take then
 		return nil
 	end
+	local wantIn = inbound and true or false
 	for i = 1, #take.events do
-		if not used[i] and take.events[i].name == name and (take.events[i].inbound and true or false) == (inbound and true or false) then
-			used[i] = true
-			return take.events[i]
+		if not used[i] then
+			local ev = take.events[i]
+			local isIn = ev.inbound and true or false
+			if namesEqual(ev.name, name) and isIn == wantIn then
+				used[i] = true
+				return ev
+			end
 		end
 	end
 	return nil
@@ -643,9 +649,16 @@ local function fireEvent(ev)
 		args[i] = cloneArg(ev.packed[i])
 	end
 	if ev.method == "FireServer" then
-		return pcall(function()
+		local ok, err = pcall(function()
 			remote:FireServer(unpack(args, 1, n))
 		end)
+		if ok then
+			return true
+		end
+		ok, err = pcall(function()
+			remote:InvokeServer(unpack(args, 1, n))
+		end)
+		return ok, err
 	end
 	if ev.method == "InvokeServer" then
 		return pcall(function()
@@ -667,9 +680,30 @@ local function doStart()
 	end
 	local text = noteBox and noteBox.Text or ""
 	local steps = parseNote(text)
-	if #steps == 0 then
-		log("Notepad has no fire()/wait() lines. Reset or record again.", THEME.WARN)
-		return
+	local outFires = 0
+	for i = 1, #steps do
+		if steps[i].kind == "fire" and not steps[i].inbound then
+			outFires = outFires + 1
+		end
+	end
+	if outFires == 0 then
+		steps = {}
+		local last = 0
+		for i = 1, #take.events do
+			local ev = take.events[i]
+			local gap = (ev.delay or 0) - last
+			if i > 1 and gap >= 0.05 then
+				steps[#steps + 1] = { kind = "wait", t = gap }
+			end
+			last = ev.delay or last
+			steps[#steps + 1] = {
+				kind = "fire",
+				name = ev.name,
+				inbound = ev.inbound and true or false,
+				invoke = ev.method == "InvokeServer",
+			}
+		end
+		log("Notepad had no outbound fire() lines — replaying the recording as saved.", THEME.WARN)
 	end
 	local loops = 1
 	if repeatBox then
