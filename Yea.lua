@@ -42,7 +42,7 @@ local S = {
 	lastPaint = 0,
 }
 
-local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox
+local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, repeatBox
 local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
 
@@ -242,21 +242,98 @@ local function scriptFromTake(take)
 		lastDelay = ev.delay or lastDelay
 		local name = tostring(ev.name or "Remote")
 		local ident = string.match(name, "^[%a_][%w_]*$")
-		local call
-		if ident then
-			call = "fire(" .. name .. "):"
-		else
-			call = "fire(" .. string.format("%q", name) .. "):"
-		end
+		local shown = ident and name or string.format("%q", name)
 		if ev.inbound then
-			lines[#lines + 1] = call .. " -- client"
+			lines[#lines + 1] = "in  fire(" .. shown .. "):  -- inbound  (game → you, Start skips this)"
 		elseif ev.method == "InvokeServer" then
-			lines[#lines + 1] = call .. " -- invoke"
+			lines[#lines + 1] = "out fire(" .. shown .. "):  -- outbound invoke"
 		else
-			lines[#lines + 1] = call .. " -- server"
+			lines[#lines + 1] = "out fire(" .. shown .. "):  -- outbound"
 		end
 	end
 	return table.concat(lines, "\n")
+end
+
+local function clipSet(text)
+	local fn = pickFn("setclipboard", "toclipboard", "set_clipboard")
+	if type(fn) == "function" then
+		return pcall(fn, text)
+	end
+	local clip = envGet("Clipboard")
+	if type(clip) == "table" and type(clip.set) == "function" then
+		return pcall(clip.set, text)
+	end
+	print(text)
+	return false
+end
+
+local function parseNameToken(tok)
+	tok = string.match(tostring(tok or ""), "^%s*(.-)%s*$") or ""
+	local dq = string.match(tok, "^\"(.*)\"$")
+	if dq then
+		return dq
+	end
+	local sq = string.match(tok, "^'(.*)'$")
+	if sq then
+		return sq
+	end
+	return tok
+end
+
+local function parseNote(text)
+	local steps = {}
+	text = tostring(text or "") .. "\n"
+	for line in string.gmatch(text, "(.-)\n") do
+		local t = string.match(line, "^%s*(.-)%s*$") or ""
+		if t ~= "" and not string.match(t, "^%-%-") then
+			local w = string.match(t, "^wait%s*%(%s*([%d%.]+)%s*%)")
+			if w then
+				steps[#steps + 1] = { kind = "wait", t = tonumber(w) or 0 }
+			else
+				local side, inner = string.match(t, "^([Ii][Nn]|[Oo][Uu][Tt])%s+[Ff][Ii][Rr][Ee]%s*%((.-)%)")
+				if not inner then
+					inner = string.match(t, "^[Ff][Ii][Rr][Ee]%s*%((.-)%)")
+				end
+				if inner then
+					local name = parseNameToken(inner)
+					local low = string.lower(t)
+					local inbound = false
+					if side and string.lower(side) == "in" then
+						inbound = true
+					end
+					if string.find(low, "inbound", 1, true) or string.find(low, "-- client", 1, true) then
+						inbound = true
+					end
+					if side and string.lower(side) == "out" then
+						inbound = false
+					end
+					if string.find(low, "outbound", 1, true) or string.find(low, "-- server", 1, true) then
+						inbound = false
+					end
+					steps[#steps + 1] = {
+						kind = "fire",
+						name = name,
+						inbound = inbound,
+						invoke = string.find(low, "invoke", 1, true) ~= nil,
+					}
+				end
+			end
+		end
+	end
+	return steps
+end
+
+local function claimEvent(take, used, name, inbound)
+	if not take then
+		return nil
+	end
+	for i = 1, #take.events do
+		if not used[i] and take.events[i].name == name and (take.events[i].inbound and true or false) == (inbound and true or false) then
+			used[i] = true
+			return take.events[i]
+		end
+	end
+	return nil
 end
 
 local function refreshList()
@@ -279,9 +356,6 @@ local function refreshList()
 		empty.TextColor3 = THEME.DIM
 		empty.Text = "  Nothing saved yet."
 		empty.Parent = listFrame
-		if noteBox then
-			noteBox.Text = "-- record, then stop. this notepad fills with fire() / wait()"
-		end
 		return
 	end
 	local maxShow = math.min(#take.events, 80)
@@ -307,9 +381,6 @@ local function refreshList()
 		more.TextColor3 = THEME.DIM
 		more.Text = "  … +" .. tostring(#take.events - maxShow) .. " more (full order is in the notepad)"
 		more.Parent = listFrame
-	end
-	if noteBox and not S.recording then
-		noteBox.Text = scriptFromTake(take)
 	end
 end
 
@@ -542,9 +613,11 @@ local function stopRecord()
 	end
 	refreshList()
 	if noteBox then
-		noteBox.Text = scriptFromTake(take)
+		local src = scriptFromTake(take)
+		noteBox.Text = src
+		S.originalNote = src
 	end
-	log(string.format("Saved. %d outgoing, %d incoming. Press Start to replay outgoing.", out, inn), THEME.OK)
+	log(string.format("Saved. %d outbound, %d inbound. Edit the notepad, then Start runs THAT script.", out, inn), THEME.OK)
 end
 
 local function toggleRecord()
@@ -592,30 +665,66 @@ local function doStart()
 		log("Nothing saved. Record something first.", THEME.WARN)
 		return
 	end
+	local text = noteBox and noteBox.Text or ""
+	local steps = parseNote(text)
+	if #steps == 0 then
+		log("Notepad has no fire()/wait() lines. Reset or record again.", THEME.WARN)
+		return
+	end
+	local loops = 1
+	if repeatBox then
+		loops = math.floor(tonumber(repeatBox.Text) or 1)
+	end
+	if loops < 1 then
+		loops = 1
+	end
+	if loops > 20 then
+		loops = 20
+	end
 	S.replaying = true
 	if startBtn then
 		startBtn.Text = "…"
 		startBtn.BackgroundColor3 = THEME.WARN
 	end
 	local fired, failed, skipped = 0, 0, 0
-	local lastDelay = 0
-	for i = 1, #take.events do
-		local ev = take.events[i]
-		local waitFor = (ev.delay or 0) - lastDelay
-		if waitFor > 0.001 then
-			pause(math.min(waitFor, 2))
-		end
-		lastDelay = ev.delay or lastDelay
-		if ev.inbound then
-			skipped = skipped + 1
-		else
-			local ok, err = fireEvent(ev)
-			if ok then
-				fired = fired + 1
+	for _ = 1, loops do
+		local used = {}
+		for s = 1, #steps do
+			local step = steps[s]
+			if step.kind == "wait" then
+				local t = step.t or 0
+				if t > 0.001 then
+					pause(math.min(t, 5))
+				end
+			elseif step.inbound then
+				skipped = skipped + 1
 			else
-				failed = failed + 1
-				log("Failed " .. tostring(ev.name) .. ": " .. tostring(err), THEME.ERR)
+				local ev = claimEvent(take, used, step.name, false)
+				if not ev then
+					failed = failed + 1
+					log("No recorded outbound args for fire(" .. tostring(step.name) .. "). Name must match a recorded outbound remote.", THEME.ERR)
+				else
+					if step.invoke then
+						ev = {
+							remote = ev.remote,
+							path = ev.path,
+							name = ev.name,
+							method = "InvokeServer",
+							packed = ev.packed,
+						}
+					end
+					local ok, err = fireEvent(ev)
+					if ok then
+						fired = fired + 1
+					else
+						failed = failed + 1
+						log("Failed " .. tostring(step.name) .. ": " .. tostring(err), THEME.ERR)
+					end
+				end
 			end
+		end
+		if loops > 1 then
+			pause(0.15)
 		end
 	end
 	S.replaying = false
@@ -623,7 +732,35 @@ local function doStart()
 		startBtn.Text = "Start"
 		startBtn.BackgroundColor3 = THEME.OK
 	end
-	log(string.format("Done. fired %d outgoing, skipped %d incoming, failed %d.", fired, skipped, failed), failed > 0 and THEME.ERR or THEME.OK)
+	log(string.format("Notepad run. fired %d outbound, skipped %d inbound, failed %d.", fired, skipped, failed), failed > 0 and THEME.ERR or THEME.OK)
+end
+
+local function doCopy()
+	local text = noteBox and noteBox.Text or ""
+	if text == "" then
+		log("Notepad is empty.", THEME.WARN)
+		return
+	end
+	if clipSet(text) then
+		log("Copied notepad.", THEME.OK)
+	else
+		log("No clipboard. Notepad printed in F9.", THEME.WARN)
+	end
+end
+
+local function doReset()
+	if S.recording then
+		log("Stop recording first.", THEME.WARN)
+		return
+	end
+	if not S.saved then
+		log("Nothing to reset.", THEME.WARN)
+		return
+	end
+	if noteBox then
+		noteBox.Text = S.originalNote or scriptFromTake(S.saved)
+	end
+	log("Notepad restored to the recording.", THEME.OK)
 end
 
 local function mkBtn(parent, text, x, w, color, fn)
@@ -765,8 +902,34 @@ local function createGui()
 	bar.Size = UDim2.new(1, -24, 0, 32)
 	bar.Parent = win
 
-	recBtn = mkBtn(bar, "Record", 0, 120, THEME.BTN, toggleRecord)
-	startBtn = mkBtn(bar, "Start", 132, 120, THEME.OK, doStart)
+	recBtn = mkBtn(bar, "Record", 0, 88, THEME.BTN, toggleRecord)
+	startBtn = mkBtn(bar, "Start", 96, 88, THEME.OK, doStart)
+	mkBtn(bar, "Copy", 192, 64, THEME.BTN, doCopy)
+	mkBtn(bar, "Reset", 264, 64, THEME.BTN, doReset)
+
+	local timesLab = Instance.new("TextLabel")
+	timesLab.BackgroundTransparency = 1
+	timesLab.Position = UDim2.fromOffset(336, 0)
+	timesLab.Size = UDim2.fromOffset(36, 32)
+	timesLab.Font = Enum.Font.Gotham
+	timesLab.TextSize = 12
+	timesLab.TextXAlignment = Enum.TextXAlignment.Right
+	timesLab.TextColor3 = THEME.DIM
+	timesLab.Text = "x"
+	timesLab.Parent = bar
+
+	repeatBox = Instance.new("TextBox")
+	repeatBox.Size = UDim2.fromOffset(40, 32)
+	repeatBox.Position = UDim2.fromOffset(376, 0)
+	repeatBox.BackgroundColor3 = THEME.PANEL
+	repeatBox.BorderSizePixel = 0
+	repeatBox.Font = Enum.Font.GothamMedium
+	repeatBox.TextSize = 13
+	repeatBox.TextColor3 = THEME.TEXT
+	repeatBox.Text = "1"
+	repeatBox.ClearTextOnFocus = false
+	repeatBox.Parent = bar
+	corner(repeatBox, 8)
 
 	local listHold = Instance.new("Frame")
 	listHold.Position = UDim2.fromOffset(12, 96)
@@ -811,8 +974,8 @@ local function createGui()
 	noteBox.TextSize = 13
 	noteBox.TextColor3 = THEME.TEXT
 	noteBox.PlaceholderColor3 = THEME.DIM
-	noteBox.PlaceholderText = "fire(Remote):\n\nwait(0.50)\n\nfire(Other):"
-	noteBox.Text = "-- record, then stop. this notepad fills with fire() / wait()"
+	noteBox.PlaceholderText = "out fire(Remote):  -- outbound\n\nwait(0.50)\n\nin  fire(Other):  -- inbound"
+	noteBox.Text = "-- record, then stop.\n-- Start runs this notepad.\n-- Delete a line to skip it. Change wait(). Prefix -- to comment out."
 	noteBox.Parent = noteHold
 
 	logLabel = Instance.new("TextLabel")
@@ -825,7 +988,7 @@ local function createGui()
 	logLabel.TextXAlignment = Enum.TextXAlignment.Left
 	logLabel.TextColor3 = THEME.DIM
 	logLabel.TextWrapped = true
-	logLabel.Text = "  Record → do the action → Record again to save. Start replays it. F10 closes."
+	logLabel.Text = "  Record → stop. Edit notepad (out/in, wait, delete lines). Start runs the notepad. F10 closes."
 	logLabel.Parent = win
 	corner(logLabel, 6)
 end
