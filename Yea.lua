@@ -25,7 +25,8 @@ local NOISY = {
 	"heartbeat", "ping", "fps", "mouse", "camera", "tick", "replicate",
 	"render", "inputstate", "lookvector", "footstep", "animation",
 	"positionupdate", "cframe", "syncpos", "characterlook", "getping",
-	"updatemouse", "physics", "collision", "cameramove",
+	"updatemouse", "physics", "collision", "cameramove", "stream",
+	"byte", "ack", "keepalive", "keep_alive", "clock",
 }
 
 local S = {
@@ -37,9 +38,11 @@ local S = {
 	replaying = false,
 	stopped = false,
 	inConns = {},
+	listDirty = false,
+	lastPaint = 0,
 }
 
-local gui, win, logLabel, recBtn, startBtn, listFrame
+local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox
 local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
 
@@ -218,7 +221,48 @@ local function log(msg, color)
 	print("[ActionSpy] " .. tostring(msg))
 end
 
+local function scriptFromTake(take)
+	if not take or #take.events == 0 then
+		return "-- nothing recorded"
+	end
+	local lines = {}
+	local lastDelay = 0
+	for i = 1, #take.events do
+		local ev = take.events[i]
+		local gap = (ev.delay or 0) - lastDelay
+		if i > 1 then
+			if gap >= 0.05 then
+				lines[#lines + 1] = ""
+				lines[#lines + 1] = string.format("wait(%.2f)", gap)
+				lines[#lines + 1] = ""
+			else
+				lines[#lines + 1] = ""
+			end
+		end
+		lastDelay = ev.delay or lastDelay
+		local name = tostring(ev.name or "Remote")
+		local ident = string.match(name, "^[%a_][%w_]*$")
+		local call
+		if ident then
+			call = "fire(" .. name .. "):"
+		else
+			call = "fire(" .. string.format("%q", name) .. "):"
+		end
+		if ev.inbound then
+			lines[#lines + 1] = call .. " -- client"
+		elseif ev.method == "InvokeServer" then
+			lines[#lines + 1] = call .. " -- invoke"
+		else
+			lines[#lines + 1] = call .. " -- server"
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
 local function refreshList()
+	if not listFrame then
+		return
+	end
 	for _, ch in ipairs(listFrame:GetChildren()) do
 		if ch:IsA("TextLabel") then
 			ch:Destroy()
@@ -233,22 +277,51 @@ local function refreshList()
 		empty.TextSize = 12
 		empty.TextXAlignment = Enum.TextXAlignment.Left
 		empty.TextColor3 = THEME.DIM
-		empty.Text = "  Nothing saved yet. Record, do the action, press Record again to stop."
+		empty.Text = "  Nothing saved yet."
 		empty.Parent = listFrame
+		if noteBox then
+			noteBox.Text = "-- record, then stop. this notepad fills with fire() / wait()"
+		end
 		return
 	end
-	for i = 1, #take.events do
+	local maxShow = math.min(#take.events, 80)
+	for i = 1, maxShow do
 		local ev = take.events[i]
 		local row = Instance.new("TextLabel")
-		row.Size = UDim2.new(1, -4, 0, 20)
+		row.Size = UDim2.new(1, -4, 0, 18)
 		row.BackgroundTransparency = 1
 		row.Font = Enum.Font.Gotham
 		row.TextSize = 12
 		row.TextXAlignment = Enum.TextXAlignment.Left
 		row.TextColor3 = ev.inbound and THEME.IN or THEME.TEXT
-		row.Text = "  " .. trunc(ev.label, 90)
+		row.Text = "  " .. trunc(ev.label, 70)
 		row.Parent = listFrame
 	end
+	if #take.events > maxShow then
+		local more = Instance.new("TextLabel")
+		more.Size = UDim2.new(1, -4, 0, 18)
+		more.BackgroundTransparency = 1
+		more.Font = Enum.Font.Gotham
+		more.TextSize = 12
+		more.TextXAlignment = Enum.TextXAlignment.Left
+		more.TextColor3 = THEME.DIM
+		more.Text = "  … +" .. tostring(#take.events - maxShow) .. " more (full order is in the notepad)"
+		more.Parent = listFrame
+	end
+	if noteBox and not S.recording then
+		noteBox.Text = scriptFromTake(take)
+	end
+end
+
+local function schedulePaint()
+	if S.recording and S.live then
+		if logLabel and logLabel.Parent then
+			logLabel.Text = "  Recording… " .. tostring(#S.live.events) .. " remotes (notepad fills when you stop)"
+			logLabel.TextColor3 = THEME.DIM
+		end
+		return
+	end
+	refreshList()
 end
 
 local function later(fn)
@@ -277,6 +350,9 @@ local function addCaptured(remote, method, inbound, packed)
 	if typeof(remote) ~= "Instance" then
 		return
 	end
+	if #S.live.events >= 250 then
+		return
+	end
 	local name = ""
 	pcall(function()
 		name = remote.Name
@@ -288,48 +364,19 @@ local function addCaptured(remote, method, inbound, packed)
 	if S.t0 == 0 then
 		S.t0 = now
 	end
-	local path = name
-	pcall(function()
-		path = remote:GetFullName()
-	end)
 	local n = packed.n or 0
-	local bits = {}
-	for i = 1, math.min(n, 5) do
-		local v = packed[i]
-		local t = typeof(v)
-		if t == "string" then
-			bits[#bits + 1] = trunc(string.format("%q", v), 24)
-		elseif t == "Instance" then
-			bits[#bits + 1] = v.Name
-		else
-			bits[#bits + 1] = trunc(tostring(v), 20)
-		end
-	end
-	if n > 5 then
-		bits[#bits + 1] = "+" .. tostring(n - 5)
-	end
 	local ev = {
 		delay = now - S.t0,
 		method = method,
 		inbound = inbound and true or false,
 		remote = remote,
 		name = name,
-		path = path,
-		className = remote.ClassName,
+		path = name,
 		packed = packed,
-		label = string.format(
-			"+%.2fs  %s  %s  %s  (%d)  %s",
-			now - S.t0,
-			inbound and "←" or "→",
-			method,
-			name,
-			n,
-			table.concat(bits, ", ")
-		),
+		label = string.format("+%.2fs  %s  %s", now - S.t0, inbound and "← client" or "→ server", name),
 	}
 	S.live.events[#S.live.events + 1] = ev
-	refreshList()
-	log((inbound and "← " or "→ ") .. method .. "  " .. name, inbound and THEME.IN or THEME.TEXT)
+	schedulePaint()
 end
 
 local function noteOutgoing(self, pretty, packed)
@@ -404,7 +451,7 @@ local function startInbound()
 	stopInbound()
 	local n = 0
 	local function consider(inst)
-		if n >= 90 or typeof(inst) ~= "Instance" then
+		if n >= 40 or typeof(inst) ~= "Instance" then
 			return
 		end
 		if not inst:IsA("RemoteEvent") and not inst:IsA("UnreliableRemoteEvent") then
@@ -430,26 +477,16 @@ local function startInbound()
 			n = n + 1
 		end
 	end
-	local roots = {
-		game:GetService("ReplicatedStorage"),
-		game:GetService("ReplicatedFirst"),
-		workspace,
-		lp,
-	}
-	for r = 1, #roots do
-		local root = roots[r]
-		if root then
-			consider(root)
-			local ok, desc = pcall(function()
-				return root:GetDescendants()
-			end)
-			if ok then
-				for i = 1, math.min(#desc, 6000) do
-					consider(desc[i])
-					if n >= 90 then
-						return
-					end
-				end
+	local rs = game:GetService("ReplicatedStorage")
+	consider(rs)
+	local ok, desc = pcall(function()
+		return rs:GetDescendants()
+	end)
+	if ok then
+		for i = 1, math.min(#desc, 2000) do
+			consider(desc[i])
+			if n >= 40 then
+				break
 			end
 		end
 	end
@@ -464,9 +501,13 @@ local function startRecord()
 	S.recording = true
 	S.t0 = 0
 	S.live = { events = {} }
+	S.lastPaint = 0
 	if recBtn then
 		recBtn.Text = "Stop"
 		recBtn.BackgroundColor3 = THEME.ERR
+	end
+	if noteBox then
+		noteBox.Text = "-- recording…"
 	end
 	refreshList()
 	log("Listening (" .. tostring(how) .. "). Do the action, then press Record again to save.", THEME.OK)
@@ -486,14 +527,23 @@ local function stopRecord()
 	local out, inn = 0, 0
 	if take then
 		for i = 1, #take.events do
-			if take.events[i].inbound then
+			local ev = take.events[i]
+			if ev.inbound then
 				inn = inn + 1
 			else
 				out = out + 1
 			end
+			pcall(function()
+				if typeof(ev.remote) == "Instance" then
+					ev.path = ev.remote:GetFullName()
+				end
+			end)
 		end
 	end
 	refreshList()
+	if noteBox then
+		noteBox.Text = scriptFromTake(take)
+	end
 	log(string.format("Saved. %d outgoing, %d incoming. Press Start to replay outgoing.", out, inn), THEME.OK)
 end
 
@@ -652,7 +702,7 @@ local function createGui()
 	parentGui(gui)
 
 	win = Instance.new("Frame")
-	win.Size = UDim2.fromOffset(420, 340)
+	win.Size = UDim2.fromOffset(720, 380)
 	win.Position = UDim2.fromOffset(64, 64)
 	win.BackgroundColor3 = THEME.BG
 	win.BorderSizePixel = 0
@@ -720,7 +770,7 @@ local function createGui()
 
 	local listHold = Instance.new("Frame")
 	listHold.Position = UDim2.fromOffset(12, 96)
-	listHold.Size = UDim2.new(1, -24, 1, -148)
+	listHold.Size = UDim2.new(0, 280, 1, -148)
 	listHold.BackgroundColor3 = THEME.PANEL
 	listHold.BorderSizePixel = 0
 	listHold.Parent = win
@@ -738,6 +788,32 @@ local function createGui()
 	local lay = Instance.new("UIListLayout")
 	lay.Padding = UDim.new(0, 1)
 	lay.Parent = listFrame
+
+	local noteHold = Instance.new("Frame")
+	noteHold.Position = UDim2.fromOffset(300, 96)
+	noteHold.Size = UDim2.new(1, -312, 1, -148)
+	noteHold.BackgroundColor3 = THEME.PANEL
+	noteHold.BorderSizePixel = 0
+	noteHold.Parent = win
+	corner(noteHold, 8)
+
+	noteBox = Instance.new("TextBox")
+	noteBox.Position = UDim2.fromOffset(8, 8)
+	noteBox.Size = UDim2.new(1, -16, 1, -16)
+	noteBox.BackgroundTransparency = 1
+	noteBox.BorderSizePixel = 0
+	noteBox.ClearTextOnFocus = false
+	noteBox.MultiLine = true
+	noteBox.TextWrapped = true
+	noteBox.TextXAlignment = Enum.TextXAlignment.Left
+	noteBox.TextYAlignment = Enum.TextYAlignment.Top
+	noteBox.Font = Enum.Font.Code
+	noteBox.TextSize = 13
+	noteBox.TextColor3 = THEME.TEXT
+	noteBox.PlaceholderColor3 = THEME.DIM
+	noteBox.PlaceholderText = "fire(Remote):\n\nwait(0.50)\n\nfire(Other):"
+	noteBox.Text = "-- record, then stop. this notepad fills with fire() / wait()"
+	noteBox.Parent = noteHold
 
 	logLabel = Instance.new("TextLabel")
 	logLabel.Position = UDim2.new(0, 12, 1, -40)
