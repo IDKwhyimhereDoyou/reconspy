@@ -74,7 +74,7 @@ local inspHold, inspArrow, inspBody, inspHead
 local f10Conn, dragConn, dragBegan, dragEnded, noteKeyConn
 local dragging, dragStart, startPos
 local resizing, resizeStart, startSize, splitting, splitStart, splitW
-local rebuildNote, layoutPanels, markPlayLine, showInspect, tryDeleteEmptyLine
+local rebuildNote, layoutPanels, markPlayLine, showInspect, tryDeleteEmptyLine, placeInspect
 local btnBase = {}
 
 local function envGet(name)
@@ -342,8 +342,9 @@ local function tyof(v)
 	return type(v)
 end
 
-local function luaVal(v, depth)
+local function luaVal(v, depth, indent)
 	depth = depth or 0
+	indent = indent or ""
 	if v == nil then
 		return "nil"
 	end
@@ -439,12 +440,16 @@ local function luaVal(v, depth)
 		if n == 0 then
 			return "{}"
 		end
+		local nextIndent = indent .. "  "
 		if isArr then
+			if n == 1 and type(v[1]) ~= "table" then
+				return "{ " .. luaVal(v[1], depth + 1, nextIndent) .. " }"
+			end
 			local parts = {}
 			for i = 1, n do
-				parts[i] = luaVal(v[i], depth + 1)
+				parts[i] = nextIndent .. luaVal(v[i], depth + 1, nextIndent)
 			end
-			return "{ " .. table.concat(parts, ", ") .. " }"
+			return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
 		end
 		local parts = {}
 		for k, val in pairs(v) do
@@ -452,15 +457,15 @@ local function luaVal(v, depth)
 			if type(k) == "string" and string.match(k, "^[%a_][%w_]*$") then
 				ks = k
 			else
-				ks = "[" .. luaVal(k, depth + 1) .. "]"
+				ks = "[" .. luaVal(k, depth + 1, nextIndent) .. "]"
 			end
-			parts[#parts + 1] = ks .. " = " .. luaVal(val, depth + 1)
+			parts[#parts + 1] = nextIndent .. ks .. " = " .. luaVal(val, depth + 1, nextIndent)
 			if #parts >= 12 then
-				parts[#parts + 1] = "--[[...]]"
+				parts[#parts + 1] = nextIndent .. "--[[...]]"
 				break
 			end
 		end
-		return "{ " .. table.concat(parts, ", ") .. " }"
+		return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
 	end
 	return "nil--[[ " .. ty .. " ]]"
 end
@@ -475,6 +480,25 @@ local function luaArgs(packed)
 		parts[i] = luaVal(packed[i])
 	end
 	return table.concat(parts, ", ")
+end
+
+local function luaArgsPretty(packed, indent)
+	indent = indent or "  "
+	if type(packed) ~= "table" then
+		return ""
+	end
+	local n = packed.n or 0
+	if n <= 0 then
+		return ""
+	end
+	if n == 1 and type(packed[1]) ~= "table" then
+		return luaVal(packed[1], 0, indent)
+	end
+	local parts = {}
+	for i = 1, n do
+		parts[i] = indent .. luaVal(packed[i], 0, indent)
+	end
+	return "\n" .. table.concat(parts, ",\n") .. "\n"
 end
 
 local function pathToLua(full)
@@ -536,12 +560,9 @@ local function eventSnippet(ev)
 	end
 	local path = remotePath(ev)
 	local className = remoteClass(ev)
-	local args = luaArgs(ev.packed)
-	if args == "" then
-		args = ""
-	end
 	local dir = ev.inbound and "game → you (inbound)" or "you → game (outbound)"
 	local method = tostring(ev.method or (ev.inbound and "OnClientEvent" or "FireServer"))
+	local n = (ev.packed and ev.packed.n) or 0
 	local lines = {
 		"-- Explorer path",
 		"-- " .. path,
@@ -552,10 +573,28 @@ local function eventSnippet(ev)
 	}
 	if ev.inbound then
 		lines[#lines + 1] = "-- received args:"
-		lines[#lines + 1] = args ~= "" and ("-- " .. args) or "-- (none)"
+		if n <= 0 then
+			lines[#lines + 1] = "-- (none)"
+		else
+			local body = luaArgsPretty(ev.packed, "  ")
+			if string.sub(body, 1, 1) == "\n" then
+				lines[#lines + 1] = "-- ("
+				for part in string.gmatch(body, "[^\n]+") do
+					lines[#lines + 1] = "-- " .. part
+				end
+				lines[#lines + 1] = "-- )"
+			else
+				lines[#lines + 1] = "-- " .. body
+			end
+		end
 	else
-		local call = pathToLua(path) .. ":" .. method .. "(" .. args .. ")"
-		lines[#lines + 1] = call
+		local target = pathToLua(path)
+		local body = luaArgsPretty(ev.packed, "  ")
+		if n <= 0 then
+			lines[#lines + 1] = target .. ":" .. method .. "()"
+		else
+			lines[#lines + 1] = target .. ":" .. method .. "(" .. body .. ")"
+		end
 	end
 	return table.concat(lines, "\n")
 end
@@ -1040,10 +1079,9 @@ showInspect = function(ev, fallback)
 		if not S.inspectOpen and inspHold then
 			S.inspectOpen = true
 			inspHold.Visible = true
-			if inspArrow then
-				inspArrow.Text = "›"
-			end
-			if layoutPanels then
+			if placeInspect then
+				placeInspect()
+			elseif layoutPanels then
 				layoutPanels()
 			end
 		end
@@ -2147,6 +2185,11 @@ local function createGui()
 			tween(win, { Size = UDim2.fromOffset(win.AbsoluteSize.X, savedH) }, 0.18)
 			minBtn.Text = "–"
 		end
+		later(function()
+			if placeInspect then
+				placeInspect()
+			end
+		end)
 	end)
 
 	dragBegan = title.InputBegan:Connect(function(input)
@@ -2172,6 +2215,9 @@ local function createGui()
 		if dragging then
 			local d = input.Position - dragStart
 			win.Position = UDim2.fromOffset(startPos.X.Offset + d.X, startPos.Y.Offset + d.Y)
+			if placeInspect then
+				placeInspect()
+			end
 		elseif splitting then
 			if S.minimized then
 				return
@@ -2379,17 +2425,16 @@ local function createGui()
 
 	inspArrow = Instance.new("TextButton")
 	inspArrow.AutoButtonColor = false
-	inspArrow.Text = "‹"
+	inspArrow.Text = "›"
 	inspArrow.Font = Enum.Font.GothamBold
 	inspArrow.TextSize = 16
 	inspArrow.TextColor3 = THEME.TEXT
 	inspArrow.BackgroundColor3 = THEME.BTN
 	inspArrow.BorderSizePixel = 0
-	inspArrow.ZIndex = 5
-	inspArrow.Parent = win
+	inspArrow.ZIndex = 20
+	inspArrow.Parent = gui
 	corner(inspArrow, 6)
 	btnBase[inspArrow] = THEME.BTN
-	addPressAnim(inspArrow)
 	inspArrow.MouseEnter:Connect(function()
 		tween(inspArrow, { BackgroundColor3 = THEME.HOVER }, 0.1)
 	end)
@@ -2402,7 +2447,8 @@ local function createGui()
 	inspHold.BorderSizePixel = 0
 	inspHold.Visible = false
 	inspHold.ClipsDescendants = true
-	inspHold.Parent = win
+	inspHold.ZIndex = 19
+	inspHold.Parent = gui
 	corner(inspHold, 8)
 	stroke(inspHold, THEME.STROKE, 1)
 
@@ -2415,6 +2461,7 @@ local function createGui()
 	inspHead.TextXAlignment = Enum.TextXAlignment.Left
 	inspHead.TextColor3 = THEME.DIM
 	inspHead.Text = "Inspector"
+	inspHead.ZIndex = 20
 	inspHead.Parent = inspHold
 
 	local inspScroll = Instance.new("ScrollingFrame")
@@ -2424,33 +2471,75 @@ local function createGui()
 	inspScroll.BorderSizePixel = 0
 	inspScroll.ScrollBarThickness = 4
 	inspScroll.ScrollBarImageColor3 = THEME.DIM
+	inspScroll.ScrollingDirection = Enum.ScrollingDirection.XY
 	inspScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-	inspScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	inspScroll.AutomaticCanvasSize = Enum.AutomaticSize.XY
+	inspScroll.ZIndex = 20
 	inspScroll.Parent = inspHold
 
 	inspBody = Instance.new("TextBox")
-	inspBody.Size = UDim2.new(1, -6, 0, 0)
-	inspBody.AutomaticSize = Enum.AutomaticSize.Y
+	inspBody.Size = UDim2.new(0, 0, 0, 0)
+	inspBody.AutomaticSize = Enum.AutomaticSize.XY
 	inspBody.BackgroundTransparency = 1
 	inspBody.BorderSizePixel = 0
 	inspBody.ClearTextOnFocus = false
 	inspBody.TextEditable = false
 	inspBody.MultiLine = true
-	inspBody.TextWrapped = true
+	inspBody.TextWrapped = false
 	inspBody.TextXAlignment = Enum.TextXAlignment.Left
 	inspBody.TextYAlignment = Enum.TextYAlignment.Top
 	inspBody.Font = Enum.Font.Code
 	inspBody.TextSize = 12
 	inspBody.TextColor3 = THEME.TEXT
 	inspBody.Text = "-- click a recorded event\n-- or a notepad line"
+	inspBody.ZIndex = 20
 	inspBody.Parent = inspScroll
+
+	placeInspect = function()
+		if not win or not inspArrow then
+			return
+		end
+		local ap = win.AbsolutePosition
+		local as = win.AbsoluteSize
+		local arrowW = 20
+		local gap = 4
+		local top = 128
+		local h = as.Y - 180
+		if h < 48 then
+			h = 48
+		end
+		if S.minimized then
+			inspArrow.Visible = false
+			if inspHold then
+				inspHold.Visible = false
+			end
+			return
+		end
+		inspArrow.Visible = true
+		if S.inspectOpen then
+			local iw = S.inspectW or 260
+			if inspHold then
+				inspHold.Visible = true
+				inspHold.Position = UDim2.fromOffset(ap.X + as.X + gap, ap.Y + top)
+				inspHold.Size = UDim2.fromOffset(iw, h)
+			end
+			inspArrow.Position = UDim2.fromOffset(ap.X + as.X + gap + iw + gap, ap.Y + top)
+			inspArrow.Size = UDim2.fromOffset(arrowW, h)
+			inspArrow.Text = "‹"
+		else
+			if inspHold then
+				inspHold.Visible = false
+			end
+			inspArrow.Position = UDim2.fromOffset(ap.X + as.X + gap, ap.Y + top)
+			inspArrow.Size = UDim2.fromOffset(arrowW, h)
+			inspArrow.Text = "›"
+		end
+	end
 
 	local function setInspectOpen(open)
 		S.inspectOpen = open and true or false
-		inspHold.Visible = S.inspectOpen
-		inspArrow.Text = S.inspectOpen and "›" or "‹"
-		if layoutPanels then
-			layoutPanels()
+		if placeInspect then
+			placeInspect()
 		end
 	end
 	inspArrow.MouseButton1Click:Connect(function()
@@ -2459,28 +2548,30 @@ local function createGui()
 
 	layoutPanels = function()
 		local lw = S.listW or 280
-		local arrowW = 18
-		local gap = 8
-		local iw = S.inspectOpen and (S.inspectW or 250) or 0
-		local rightPad = 12 + arrowW + (S.inspectOpen and (gap + iw) or 0)
 		listHold.Position = UDim2.fromOffset(12, 128)
 		listHold.Size = UDim2.new(0, lw, 1, -180)
 		splitBar.Position = UDim2.fromOffset(12 + lw + 1, 140)
 		splitBar.Size = UDim2.new(0, 6, 1, -204)
 		noteHold.Position = UDim2.fromOffset(12 + lw + 10, 128)
-		noteHold.Size = UDim2.new(1, -(12 + lw + 10 + rightPad), 1, -180)
-		if S.inspectOpen then
-			inspHold.Position = UDim2.new(1, -(12 + iw), 0, 128)
-			inspHold.Size = UDim2.fromOffset(iw, 0)
-			inspHold.Size = UDim2.new(0, iw, 1, -180)
-			inspArrow.Position = UDim2.new(1, -(12 + iw + gap + arrowW), 0, 128)
-		else
-			inspArrow.Position = UDim2.new(1, -(12 + arrowW), 0, 128)
+		noteHold.Size = UDim2.new(1, -(12 + lw + 10 + 12), 1, -180)
+		if placeInspect then
+			placeInspect()
 		end
-		inspArrow.Size = UDim2.new(0, arrowW, 1, -180)
 	end
 	layoutPanels()
 	setInspectOpen(false)
+	pcall(function()
+		win:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
+			if placeInspect then
+				placeInspect()
+			end
+		end)
+		win:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+			if placeInspect then
+				placeInspect()
+			end
+		end)
+	end)
 
 	noteScroll = Instance.new("ScrollingFrame")
 	noteScroll.Position = UDim2.fromOffset(4, 4)
