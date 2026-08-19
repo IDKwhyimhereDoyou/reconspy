@@ -64,6 +64,7 @@ local LINE_H = 18
 local noteData = { "-- record, then stop.", "-- Click a line to edit. Enter = new line. Empty + Backspace = delete." }
 local editSlot = 1
 local noteRowFrames = {}
+local noteBusy = false
 
 local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, noteScroll, argLab
 local repeatBox, gapBox, waitAllBox, filterBox, statusLab, listHold, noteHold, splitBar
@@ -171,6 +172,34 @@ local function tween(inst, props, t)
 			props
 		):Play()
 	end)
+end
+
+local function addPressAnim(b)
+	if not b then
+		return
+	end
+	local sc = Instance.new("UIScale")
+	sc.Scale = 1
+	sc.Parent = b
+	if b.AnchorPoint == Vector2.new(0, 0) and b.Size.X.Scale == 0 and b.Size.Y.Scale == 0 then
+		local sz = b.Size
+		local pos = b.Position
+		b.AnchorPoint = Vector2.new(0.5, 0.5)
+		b.Position = UDim2.new(
+			pos.X.Scale,
+			pos.X.Offset + sz.X.Offset * 0.5,
+			pos.Y.Scale,
+			pos.Y.Offset + sz.Y.Offset * 0.5
+		)
+	end
+	b.MouseButton1Down:Connect(function()
+		tween(sc, { Scale = 0.88 }, 0.06)
+	end)
+	local function restore()
+		tween(sc, { Scale = 1 }, 0.1)
+	end
+	b.MouseButton1Up:Connect(restore)
+	b.MouseLeave:Connect(restore)
 end
 
 local function isInst(v)
@@ -717,7 +746,7 @@ local function splitNote(text)
 end
 
 local function commitEdit()
-	if noteBox and noteBox.Parent and editSlot then
+	if noteBox and noteBox.Parent and type(editSlot) == "number" and noteData[editSlot] ~= nil then
 		noteData[editSlot] = noteBox.Text
 	end
 end
@@ -728,12 +757,15 @@ local function getNoteText()
 end
 
 local function setNoteText(text)
+	noteBusy = true
+	noteBox = nil
+	editSlot = nil
 	noteData = splitNote(text)
-	if S.editIndex < 1 or S.editIndex > #noteData then
-		S.editIndex = 1
-	end
+	S.editIndex = 1
 	if rebuildNote then
 		rebuildNote(false)
+	else
+		noteBusy = false
 	end
 end
 
@@ -1620,6 +1652,21 @@ local function doReset()
 	log("Notepad restored to the recording.", THEME.OK)
 end
 
+local function filterSavedBySelection(keepHit)
+	if not S.saved or not S.saved.events then
+		return
+	end
+	local evs = {}
+	for i = 1, #S.saved.events do
+		local ev = S.saved.events[i]
+		local hit = S.selected[typeKey(ev.inbound, ev.name)] and true or false
+		if hit == keepHit then
+			evs[#evs + 1] = ev
+		end
+	end
+	S.saved.events = evs
+end
+
 local function doDeleteAll()
 	if S.recording then
 		log("Stop recording first.", THEME.WARN)
@@ -1630,26 +1677,38 @@ local function doDeleteAll()
 		return
 	end
 	if selectedCount() == 0 then
-		log("Click a line first (Ctrl+click for more), then Delete all.", THEME.WARN)
+		log("Click a remote first (Ctrl+click for more), then Delete all.", THEME.WARN)
 		return
 	end
 	local types = selectedCount()
-	if S.saved and S.saved.events then
-		local evs = {}
-		for i = 1, #S.saved.events do
-			local ev = S.saved.events[i]
-			local key = typeKey(ev.inbound, ev.name)
-			if not S.selected[key] then
-				evs[#evs + 1] = ev
-			end
-		end
-		S.saved.events = evs
-	end
+	filterSavedBySelection(false)
 	setNoteText(scriptFromTake(S.saved))
 	S.selected = {}
 	refreshList()
 	local after = S.saved and S.saved.events and #S.saved.events or 0
 	log(string.format("Removed %d type(s). Notepad now matches the %d leftover recorded events.", types, after), THEME.OK)
+end
+
+local function doKeepOnly()
+	if S.recording then
+		log("Stop recording first.", THEME.WARN)
+		return
+	end
+	if S.replaying then
+		log("Wait until Start finishes.", THEME.WARN)
+		return
+	end
+	if selectedCount() == 0 then
+		log("Click a remote first (Ctrl+click for more), then Keep only.", THEME.WARN)
+		return
+	end
+	local types = selectedCount()
+	filterSavedBySelection(true)
+	setNoteText(scriptFromTake(S.saved))
+	S.selected = {}
+	refreshList()
+	local after = S.saved and S.saved.events and #S.saved.events or 0
+	log(string.format("Kept %d type(s). Notepad now matches the %d remaining recorded events.", types, after), THEME.OK)
 end
 
 local function doSetWaits()
@@ -1730,6 +1789,7 @@ local function mkBtn(parent, text, x, w, color, fn)
 		tween(b, { BackgroundColor3 = btnBase[b] or base }, 0.1)
 	end)
 	b.MouseButton1Click:Connect(fn)
+	addPressAnim(b)
 	return b
 end
 
@@ -1850,6 +1910,7 @@ local function createGui()
 	minBtn.AutoButtonColor = false
 	minBtn.Parent = top
 	corner(minBtn, 6)
+	addPressAnim(minBtn)
 
 	local close = Instance.new("TextButton")
 	close.Size = UDim2.fromOffset(28, 24)
@@ -1863,6 +1924,7 @@ local function createGui()
 	close.AutoButtonColor = false
 	close.Parent = top
 	corner(close, 6)
+	addPressAnim(close)
 	close.MouseEnter:Connect(function()
 		tween(close, { BackgroundColor3 = THEME.ERR }, 0.1)
 	end)
@@ -2008,12 +2070,13 @@ local function createGui()
 	bar2.Size = UDim2.new(1, -24, 0, 32)
 	bar2.Parent = win
 
-	mkBtn(bar2, "Delete all", 0, 88, THEME.ERR, doDeleteAll)
+	mkBtn(bar2, "Delete all", 0, 78, THEME.ERR, doDeleteAll)
+	mkBtn(bar2, "Keep only", 82, 74, THEME.OK, doKeepOnly)
 
 	local waitLab = Instance.new("TextLabel")
 	waitLab.BackgroundTransparency = 1
-	waitLab.Position = UDim2.fromOffset(96, 0)
-	waitLab.Size = UDim2.fromOffset(32, 32)
+	waitLab.Position = UDim2.fromOffset(160, 0)
+	waitLab.Size = UDim2.fromOffset(28, 32)
 	waitLab.Font = Enum.Font.Gotham
 	waitLab.TextSize = 11
 	waitLab.TextXAlignment = Enum.TextXAlignment.Right
@@ -2022,8 +2085,8 @@ local function createGui()
 	waitLab.Parent = bar2
 
 	waitAllBox = Instance.new("TextBox")
-	waitAllBox.Size = UDim2.fromOffset(44, 32)
-	waitAllBox.Position = UDim2.fromOffset(132, 0)
+	waitAllBox.Size = UDim2.fromOffset(40, 32)
+	waitAllBox.Position = UDim2.fromOffset(192, 0)
 	waitAllBox.BackgroundColor3 = THEME.PANEL
 	waitAllBox.BorderSizePixel = 0
 	waitAllBox.Font = Enum.Font.GothamMedium
@@ -2034,9 +2097,9 @@ local function createGui()
 	waitAllBox.Parent = bar2
 	corner(waitAllBox, 8)
 
-	mkBtn(bar2, "Set waits", 184, 80, THEME.BTN, doSetWaits)
-	mkBtn(bar2, "From here", 272, 84, THEME.OK, doFromHere)
-	mkBtn(bar2, "Fire 1", 364, 64, THEME.BTN, doFireOne)
+	mkBtn(bar2, "Set waits", 238, 76, THEME.BTN, doSetWaits)
+	mkBtn(bar2, "From here", 320, 78, THEME.OK, doFromHere)
+	mkBtn(bar2, "Fire 1", 404, 54, THEME.BTN, doFireOne)
 
 	listHold = Instance.new("Frame")
 	listHold.BackgroundColor3 = THEME.PANEL
@@ -2183,7 +2246,10 @@ local function createGui()
 	argLab.Parent = noteHold
 
 	rebuildNote = function(grab)
-		commitEdit()
+		noteBusy = true
+		if noteBox and noteBox.Parent and type(editSlot) == "number" then
+			commitEdit()
+		end
 		if #noteData == 0 then
 			noteData[1] = ""
 		end
@@ -2245,11 +2311,17 @@ local function createGui()
 				previewArgs()
 			end)
 			box:GetPropertyChangedSignal("Text"):Connect(function()
+				if noteBusy then
+					return
+				end
 				noteData[idx] = box.Text
 				box.TextColor3 = lineColor(box.Text)
 				previewArgs()
 			end)
 			box.FocusLost:Connect(function(enter)
+				if noteBusy then
+					return
+				end
 				noteData[idx] = box.Text
 				if enter then
 					table.insert(noteData, idx + 1, "")
@@ -2288,6 +2360,7 @@ local function createGui()
 				end
 			end)
 		end
+		noteBusy = false
 		previewArgs()
 		if grab and noteBox then
 			later(function()
