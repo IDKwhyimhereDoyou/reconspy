@@ -462,6 +462,33 @@ local function copyTake(take)
 	return { events = evs }
 end
 
+local function trimLine(s)
+	return string.match(tostring(s or ""), "^%s*(.-)%s*$") or ""
+end
+
+local function isWaitLine(s)
+	local t = trimLine(s)
+	return t ~= "" and not string.match(t, "^%-%-") and string.match(t, "^wait%s*%(") ~= nil
+end
+
+local function squashWaits(lines)
+	local out = {}
+	local i = 1
+	while i <= #lines do
+		if isWaitLine(lines[i]) then
+			out[#out + 1] = lines[i]
+			i = i + 1
+			while i <= #lines and (trimLine(lines[i]) == "" or isWaitLine(lines[i])) do
+				i = i + 1
+			end
+		else
+			out[#out + 1] = lines[i]
+			i = i + 1
+		end
+	end
+	return out
+end
+
 local function selectedCount()
 	local n = 0
 	for _ in pairs(S.selected or {}) do
@@ -1081,7 +1108,7 @@ local function doDeleteAll()
 				keep[#keep + 1] = line
 			end
 		end
-		noteBox.Text = table.concat(keep, "\n")
+		noteBox.Text = table.concat(squashWaits(keep), "\n")
 	end
 	if S.saved and S.saved.events then
 		local evs = {}
@@ -1126,16 +1153,21 @@ local function doSetWaits()
 	local keep = {}
 	local text = tostring(noteBox.Text or "") .. "\n"
 	for line in string.gmatch(text, "(.-)\n") do
-		local t = string.match(line, "^%s*(.-)%s*$") or ""
+		local t = trimLine(line)
 		if t ~= "" and not string.match(t, "^%-%-") and string.match(t, "^wait%s*%(") then
 			keep[#keep + 1] = string.format("wait(%.2f)", sec)
-			n = n + 1
 		else
 			keep[#keep + 1] = line
 		end
 	end
+	keep = squashWaits(keep)
+	for i = 1, #keep do
+		if isWaitLine(keep[i]) then
+			n = n + 1
+		end
+	end
 	noteBox.Text = table.concat(keep, "\n")
-	log(string.format("Set %d wait() to %.2f.", n, sec), THEME.OK)
+	log(string.format("Set waits to %.2f (%d wait line(s), extras in a row removed).", sec, n), THEME.OK)
 end
 
 local function mkBtn(parent, text, x, w, color, fn)
@@ -1465,6 +1497,10 @@ local function createGui()
 	noteOverlay.BorderSizePixel = 0
 	noteOverlay.RichText = true
 	noteOverlay.TextWrapped = true
+	noteOverlay.Active = false
+	pcall(function()
+		noteOverlay.Interactable = false
+	end)
 	noteOverlay.TextXAlignment = Enum.TextXAlignment.Left
 	noteOverlay.TextYAlignment = Enum.TextYAlignment.Top
 	noteOverlay.Font = Enum.Font.Code
@@ -1478,11 +1514,7 @@ local function createGui()
 			return
 		end
 		noteOverlay.Size = noteBox.Size
-		local focused = false
-		pcall(function()
-			focused = noteBox:IsFocused()
-		end)
-		if focused or noteBox.Text == "" then
+		if noteBox.Text == "" then
 			noteBox.TextTransparency = 0
 			noteOverlay.Visible = false
 			return
