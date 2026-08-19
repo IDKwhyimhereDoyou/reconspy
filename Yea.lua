@@ -7,7 +7,6 @@ local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
-local TextService = game:GetService("TextService")
 local lp = Players.LocalPlayer
 
 local THEME = {
@@ -51,15 +50,19 @@ local S = {
 	stopReplay = false,
 	selected = {},
 	backup = nil,
-	lastCursor = 1,
+	editIndex = 1,
 }
 
-local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, noteOverlay, noteScroll, noteCaret, noteLineHi
+local LINE_H = 18
+local noteData = { "-- record, then stop.", "-- Start runs this notepad. Lua copies a real FireServer script.", "-- Click a line to edit. Enter = new line. Empty + Backspace = delete." }
+local editSlot = 1
+
+local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, noteScroll, argLab
 local repeatBox, gapBox, waitAllBox
 local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
 local resizing, resizeStart, startSize
-local paintCaret
+local rebuildNote
 
 local function envGet(name)
 	if type(getgenv) == "function" then
@@ -163,40 +166,22 @@ local function isNoisy(name)
 	return false
 end
 
-local function rgbTag(c)
-	return string.format(
-		"rgb(%d,%d,%d)",
-		math.floor(c.R * 255 + 0.5),
-		math.floor(c.G * 255 + 0.5),
-		math.floor(c.B * 255 + 0.5)
-	)
-end
-
-local function escapeRich(s)
-	s = string.gsub(tostring(s or ""), "&", "&amp;")
-	s = string.gsub(s, "<", "&lt;")
-	s = string.gsub(s, ">", "&gt;")
-	return s
-end
-
-local function colorNote(text)
-	local chunks = {}
-	text = tostring(text or "") .. "\n"
-	for line in string.gmatch(text, "(.-)\n") do
-		local low = string.lower(line)
-		local col = THEME.TEXT
-		if string.match(low, "^%s*%-%-") or line == "" then
-			col = THEME.DIM
-		elseif string.match(low, "^%s*in[%s%p]") then
-			col = THEME.IN
-		elseif string.match(low, "^%s*out[%s%p]") then
-			col = THEME.OUT
-		elseif string.match(low, "^%s*wait%s*%(") then
-			col = THEME.WARN
-		end
-		chunks[#chunks + 1] = '<font color="' .. rgbTag(col) .. '">' .. escapeRich(line) .. "</font>"
+local function lineColor(line)
+	local low = string.lower(tostring(line or ""))
+	local t = string.match(tostring(line or ""), "^%s*(.-)%s*$") or ""
+	if t == "" or string.match(low, "^%s*%-%-") then
+		return THEME.DIM
 	end
-	return table.concat(chunks, "<br/>")
+	if string.match(low, "^%s*in[%s%p]") then
+		return THEME.IN
+	end
+	if string.match(low, "^%s*out[%s%p]") then
+		return THEME.OUT
+	end
+	if string.match(low, "^%s*wait%s*%(") then
+		return THEME.WARN
+	end
+	return THEME.TEXT
 end
 
 local function splitDot(s)
@@ -263,6 +248,151 @@ local function cloneArg(v)
 		return HttpService:GenerateGUID(false)
 	end
 	return v
+end
+
+local function tyof(v)
+	if type(typeof) == "function" then
+		local ok, t = pcall(typeof, v)
+		if ok then
+			return t
+		end
+	end
+	return type(v)
+end
+
+local function luaVal(v, depth)
+	depth = depth or 0
+	if v == nil then
+		return "nil"
+	end
+	if depth > 3 then
+		return "nil--[[depth]]"
+	end
+	local ty = tyof(v)
+	if ty == "boolean" then
+		if v then
+			return "true"
+		end
+		return "false"
+	end
+	if ty == "number" then
+		if v ~= v then
+			return "0/0"
+		end
+		if v == math.huge then
+			return "math.huge"
+		end
+		if v == -math.huge then
+			return "-math.huge"
+		end
+		return string.format("%.10g", v)
+	end
+	if ty == "string" then
+		return string.format("%q", v)
+	end
+	if ty == "Vector3" then
+		return string.format("Vector3.new(%.5f, %.5f, %.5f)", v.X, v.Y, v.Z)
+	end
+	if ty == "Vector2" then
+		return string.format("Vector2.new(%.5f, %.5f)", v.X, v.Y)
+	end
+	if ty == "CFrame" then
+		local ok, a, b, c, d, e, f, g, h, i, j, k, l = pcall(function()
+			return v:GetComponents()
+		end)
+		if ok then
+			return string.format(
+				"CFrame.new(%.5f, %.5f, %.5f, %.5f, %.5f, %.5f, %.5f, %.5f, %.5f, %.5f, %.5f, %.5f)",
+				a, b, c, d, e, f, g, h, i, j, k, l
+			)
+		end
+	end
+	if ty == "Color3" then
+		return string.format("Color3.new(%.5f, %.5f, %.5f)", v.R, v.G, v.B)
+	end
+	if ty == "UDim2" then
+		return string.format(
+			"UDim2.new(%.4f, %d, %.4f, %d)",
+			v.X.Scale,
+			v.X.Offset,
+			v.Y.Scale,
+			v.Y.Offset
+		)
+	end
+	if ty == "UDim" then
+		return string.format("UDim.new(%.4f, %d)", v.Scale, v.Offset)
+	end
+	if ty == "BrickColor" then
+		return string.format("BrickColor.new(%q)", tostring(v))
+	end
+	if ty == "EnumItem" then
+		return tostring(v)
+	end
+	if ty == "Instance" then
+		local ok, full = pcall(function()
+			return v:GetFullName()
+		end)
+		if not ok or not full then
+			return "nil--[[instance]]"
+		end
+		local s = "game"
+		for part in string.gmatch(full, "[^.]+") do
+			if string.match(part, "^[%a_][%w_]*$") then
+				s = s .. "." .. part
+			else
+				s = s .. ":FindFirstChild(" .. string.format("%q", part) .. ")"
+			end
+		end
+		return s
+	end
+	if ty == "table" then
+		local n = 0
+		local isArr = true
+		for k, _ in pairs(v) do
+			n = n + 1
+			if type(k) ~= "number" or k < 1 or k % 1 ~= 0 then
+				isArr = false
+			end
+		end
+		if n == 0 then
+			return "{}"
+		end
+		if isArr then
+			local parts = {}
+			for i = 1, n do
+				parts[i] = luaVal(v[i], depth + 1)
+			end
+			return "{ " .. table.concat(parts, ", ") .. " }"
+		end
+		local parts = {}
+		for k, val in pairs(v) do
+			local ks
+			if type(k) == "string" and string.match(k, "^[%a_][%w_]*$") then
+				ks = k
+			else
+				ks = "[" .. luaVal(k, depth + 1) .. "]"
+			end
+			parts[#parts + 1] = ks .. " = " .. luaVal(val, depth + 1)
+			if #parts >= 12 then
+				parts[#parts + 1] = "--[[...]]"
+				break
+			end
+		end
+		return "{ " .. table.concat(parts, ", ") .. " }"
+	end
+	return "nil--[[ " .. ty .. " ]]"
+end
+
+local function luaArgs(packed)
+	if type(packed) ~= "table" then
+		return ""
+	end
+	local n = packed.n or 0
+	local parts = {}
+	for i = 1, n do
+		parts[i] = luaVal(packed[i])
+	end
+	return table.concat(parts, ", ")
 end
 
 local function pause(sec)
@@ -506,61 +636,59 @@ local function selectedCount()
 	return n
 end
 
-local function notePos()
-	if noteBox then
-		local p = noteBox.CursorPosition
-		if type(p) == "number" and p > 0 then
-			S.lastCursor = p
-			return p
-		end
+local function splitNote(text)
+	local t = {}
+	local s = tostring(text or "")
+	if s == "" then
+		return { "" }
 	end
-	return S.lastCursor or 1
+	for line in string.gmatch(s .. "\n", "(.-)\n") do
+		t[#t + 1] = line
+	end
+	if #t == 0 then
+		t[1] = ""
+	end
+	return t
+end
+
+local function commitEdit()
+	if noteBox and noteBox.Parent and editSlot then
+		noteData[editSlot] = noteBox.Text
+	end
+end
+
+local function getNoteText()
+	commitEdit()
+	return table.concat(noteData, "\n")
+end
+
+local function setNoteText(text)
+	noteData = splitNote(text)
+	if S.editIndex < 1 or S.editIndex > #noteData then
+		S.editIndex = 1
+	end
+	if rebuildNote then
+		rebuildNote(false)
+	end
 end
 
 local function cursorLine()
-	local text = tostring(noteBox and noteBox.Text or "")
-	local pos = notePos()
-	local before = string.sub(text, 1, math.max(pos - 1, 0))
-	local line = 1
-	for i = 1, #before do
-		if string.sub(before, i, i) == "\n" then
-			line = line + 1
-		end
-	end
-	return line
-end
-
-local function cursorPrefix()
-	local text = tostring(noteBox and noteBox.Text or "")
-	local pos = notePos()
-	local before = string.sub(text, 1, math.max(pos - 1, 0))
-	local last = 0
-	for i = 1, #before do
-		if string.sub(before, i, i) == "\n" then
-			last = i
-		end
-	end
-	return string.sub(before, last + 1)
+	return S.editIndex or 1
 end
 
 local function jumpNoteToKey(key)
-	if not noteBox or not key then
+	if not key then
 		return
 	end
-	local text = tostring(noteBox.Text or "") .. "\n"
-	local at = 1
-	local lineNo = 1
-	for line in string.gmatch(text, "(.-)\n") do
-		if keyFromLine(line) == key then
-			S.lastCursor = at
-			pcall(function()
-				noteBox.CursorPosition = at
-			end)
-			if paintCaret then
-				paintCaret()
+	commitEdit()
+	for i = 1, #noteData do
+		if keyFromLine(noteData[i]) == key then
+			S.editIndex = i
+			if rebuildNote then
+				rebuildNote(true)
 			end
 			if noteScroll then
-				local y = (lineNo - 1) * 16 - 24
+				local y = (i - 1) * LINE_H - 24
 				if y < 0 then
 					y = 0
 				end
@@ -568,8 +696,6 @@ local function jumpNoteToKey(key)
 			end
 			return
 		end
-		at = at + #line + 1
-		lineNo = lineNo + 1
 	end
 end
 
@@ -589,6 +715,65 @@ local function claimEvent(take, used, name, inbound)
 		end
 	end
 	return nil
+end
+
+local function previewArgs()
+	if not argLab then
+		return
+	end
+	commitEdit()
+	local line = S.editIndex or 1
+	local steps = parseNote(getNoteText())
+	local idx
+	for i = 1, #steps do
+		if steps[i].line == line then
+			idx = i
+			break
+		end
+	end
+	if not idx then
+		argLab.Text = "  click a line · Enter new line · empty Backspace deletes · Lua copies FireServer"
+		argLab.TextColor3 = THEME.DIM
+		return
+	end
+	local step = steps[idx]
+	if step.kind == "wait" then
+		argLab.Text = string.format("  wait(%.2f)", step.t or 0)
+		argLab.TextColor3 = THEME.WARN
+		return
+	end
+	if step.inbound then
+		argLab.Text = "  in " .. tostring(step.name) .. "  (game → you, Start/Lua skip this)"
+		argLab.TextColor3 = THEME.IN
+		return
+	end
+	local take = S.saved
+	if not take then
+		argLab.Text = "  out " .. tostring(step.name) .. "  (record first to capture args)"
+		argLab.TextColor3 = THEME.OUT
+		return
+	end
+	local used = {}
+	for i = 1, idx - 1 do
+		if steps[i].kind == "fire" and not steps[i].inbound then
+			claimEvent(take, used, steps[i].name, false)
+		end
+	end
+	local ev = claimEvent(take, used, step.name, false)
+	if not ev then
+		argLab.Text = "  out " .. tostring(step.name) .. "  (no saved args)"
+		argLab.TextColor3 = THEME.ERR
+		return
+	end
+	local shown = luaArgs(ev.packed)
+	if shown == "" then
+		shown = "no args"
+	end
+	argLab.Text = trunc(
+		"  " .. tostring(ev.method or "FireServer") .. "  " .. tostring(step.name) .. "(" .. shown .. ")",
+		240
+	)
+	argLab.TextColor3 = THEME.OUT
 end
 
 local function refreshList()
@@ -902,7 +1087,7 @@ local function startRecord()
 		recBtn.BackgroundColor3 = THEME.ERR
 	end
 	if noteBox then
-		noteBox.Text = "-- recording…"
+		setNoteText("-- recording…")
 	end
 	refreshList()
 	log("Listening (" .. tostring(how) .. "). Do the action, then press Record again to save.", THEME.OK)
@@ -938,9 +1123,9 @@ local function stopRecord()
 		end
 	end
 	refreshList()
-	if noteBox then
+	if noteBox or rebuildNote then
 		local src = scriptFromTake(take)
-		noteBox.Text = src
+		setNoteText(src)
 		S.originalNote = src
 	end
 	log(string.format("Saved. %d outbound, %d inbound. Edit the notepad, then Start runs THAT script.", out, inn), THEME.OK)
@@ -1143,7 +1328,7 @@ local function doStart()
 		log("Nothing saved. Record something first.", THEME.WARN)
 		return
 	end
-	local text = noteBox and noteBox.Text or ""
+	local text = getNoteText()
 	local steps = parseNote(text)
 	local outFires = 0
 	for i = 1, #steps do
@@ -1172,7 +1357,7 @@ local function doFromHere()
 		log("Nothing saved. Record something first.", THEME.WARN)
 		return
 	end
-	local steps = parseNote(noteBox and noteBox.Text or "")
+	local steps = parseNote(getNoteText())
 	local line = cursorLine()
 	local startAt
 	for i = 1, #steps do
@@ -1212,7 +1397,7 @@ local function doFireOne()
 		log("Nothing saved. Record something first.", THEME.WARN)
 		return
 	end
-	local steps = parseNote(noteBox and noteBox.Text or "")
+	local steps = parseNote(getNoteText())
 	local line = cursorLine()
 	local idx
 	for i = 1, #steps do
@@ -1255,7 +1440,7 @@ local function doFireOne()
 end
 
 local function doCopy()
-	local body = noteBox and noteBox.Text or ""
+	local body = getNoteText()
 	if body == "" or string.find(body, "nothing recorded", 1, true) then
 		log("Notepad is empty. Record first.", THEME.WARN)
 		return
@@ -1264,9 +1449,89 @@ local function doCopy()
 		.. "-- out = you → game   in = game → you (Start skips in)\n\n"
 		.. body
 	if clipSet(script) then
-		log("Copied script to clipboard.", THEME.OK)
+		log("Copied notepad to clipboard.", THEME.OK)
 	else
 		log("Clipboard blocked. Script printed in F9 console.", THEME.WARN)
+	end
+end
+
+local function buildLuaScript()
+	local take = S.saved
+	local steps = parseNote(getNoteText())
+	local lines = {
+		"-- ActionSpy Lua export  (paste into an executor)",
+		"-- Uses the args captured when you recorded. Inbound lines are comments.",
+		"local RS = game:GetService(\"ReplicatedStorage\")",
+		"local function findRemote(name, path)",
+		"	if type(path) == \"string\" and path ~= \"\" and path ~= name then",
+		"		local cur = game",
+		"		for part in string.gmatch(path, \"[^.]+\") do",
+		"			cur = cur:FindFirstChild(part)",
+		"			if not cur then break end",
+		"		end",
+		"		if cur then return cur end",
+		"	end",
+		"	for _, d in ipairs(RS:GetDescendants()) do",
+		"		if d.Name == name and (d:IsA(\"RemoteEvent\") or d:IsA(\"RemoteFunction\") or d:IsA(\"UnreliableRemoteEvent\")) then",
+		"			return d",
+		"		end",
+		"	end",
+		"end",
+		"local function out(name, path, method, ...)",
+		"	local r = findRemote(name, path)",
+		"	if not r then return end",
+		"	if method == \"InvokeServer\" then",
+		"		pcall(function() r:InvokeServer(...) end)",
+		"	else",
+		"		pcall(function() r:FireServer(...) end)",
+		"	end",
+		"end",
+		"",
+	}
+	-- fix the gmatch line - I accidentally put a space in the pattern
+	-- I'll write it properly in the actual file
+	local used = {}
+	for i = 1, #steps do
+		local step = steps[i]
+		if step.kind == "wait" then
+			lines[#lines + 1] = string.format("task.wait(%.2f)", step.t or 0)
+		elseif step.kind == "fire" and step.inbound then
+			lines[#lines + 1] = "-- in " .. tostring(step.name)
+		elseif step.kind == "fire" then
+			local ev = take and claimEvent(take, used, step.name, false)
+			local path = ev and ev.path or step.name
+			local method = "FireServer"
+			if (ev and ev.method == "InvokeServer") or step.invoke then
+				method = "InvokeServer"
+			end
+			local args = ev and luaArgs(ev.packed) or ""
+			local nameQ = string.format("%q", tostring(step.name))
+			local pathQ = string.format("%q", tostring(path))
+			if args ~= "" then
+				lines[#lines + 1] = string.format("out(%s, %s, %q, %s)", nameQ, pathQ, method, args)
+			else
+				lines[#lines + 1] = string.format("out(%s, %s, %q)", nameQ, pathQ, method)
+			end
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+local function doCopyLua()
+	if S.recording then
+		log("Stop recording first.", THEME.WARN)
+		return
+	end
+	local body = getNoteText()
+	if body == "" or string.find(body, "nothing recorded", 1, true) then
+		log("Nothing to export. Record first.", THEME.WARN)
+		return
+	end
+	local src = buildLuaScript()
+	if clipSet(src) then
+		log("Copied Lua (real FireServer + args) to clipboard.", THEME.OK)
+	else
+		log("Clipboard blocked. Lua printed in F9 console.", THEME.WARN)
 	end
 end
 
@@ -1279,9 +1544,7 @@ local function doReset()
 		log("Nothing to reset.", THEME.WARN)
 		return
 	end
-	if noteBox then
-		noteBox.Text = S.originalNote or scriptFromTake(S.backup or S.saved)
-	end
+	setNoteText(S.originalNote or scriptFromTake(S.backup or S.saved))
 	if S.backup then
 		S.saved = copyTake(S.backup)
 	end
@@ -1304,19 +1567,17 @@ local function doDeleteAll()
 		return
 	end
 	local removed = 0
-	if noteBox then
-		local keep = {}
-		local text = tostring(noteBox.Text or "") .. "\n"
-		for line in string.gmatch(text, "(.-)\n") do
-			local key = keyFromLine(line)
-			if key and S.selected[key] then
-				removed = removed + 1
-			else
-				keep[#keep + 1] = line
-			end
+	local keep = {}
+	local text = getNoteText() .. "\n"
+	for line in string.gmatch(text, "(.-)\n") do
+		local key = keyFromLine(line)
+		if key and S.selected[key] then
+			removed = removed + 1
+		else
+			keep[#keep + 1] = line
 		end
-		noteBox.Text = table.concat(squashWaits(keep), "\n")
 	end
+	setNoteText(table.concat(squashWaits(keep), "\n"))
 	if S.saved and S.saved.events then
 		local evs = {}
 		for i = 1, #S.saved.events do
@@ -1343,9 +1604,6 @@ local function doSetWaits()
 		log("Wait until Start finishes.", THEME.WARN)
 		return
 	end
-	if not noteBox then
-		return
-	end
 	local sec = tonumber(waitAllBox and waitAllBox.Text or "")
 	if not sec then
 		log("Type a wait time first, e.g. 0.10", THEME.WARN)
@@ -1358,7 +1616,7 @@ local function doSetWaits()
 	end
 	local n = 0
 	local keep = {}
-	local text = tostring(noteBox.Text or "") .. "\n"
+	local text = getNoteText() .. "\n"
 	for line in string.gmatch(text, "(.-)\n") do
 		local t = trimLine(line)
 		if t ~= "" and not string.match(t, "^%-%-") and string.match(t, "^wait%s*%(") then
@@ -1373,7 +1631,7 @@ local function doSetWaits()
 			n = n + 1
 		end
 	end
-	noteBox.Text = table.concat(keep, "\n")
+	setNoteText(table.concat(keep, "\n"))
 	log(string.format("Set waits to %.2f (%d wait line(s), extras in a row removed).", sec, n), THEME.OK)
 end
 
@@ -1625,6 +1883,7 @@ local function createGui()
 	mkBtn(bar2, "Set waits", 184, 80, THEME.BTN, doSetWaits)
 	mkBtn(bar2, "From here", 272, 84, THEME.OK, doFromHere)
 	mkBtn(bar2, "Fire 1", 364, 64, THEME.BTN, doFireOne)
+	mkBtn(bar2, "Lua", 436, 52, THEME.OK, doCopyLua)
 
 	local listHold = Instance.new("Frame")
 	listHold.Position = UDim2.fromOffset(12, 128)
@@ -1657,238 +1916,168 @@ local function createGui()
 
 	noteScroll = Instance.new("ScrollingFrame")
 	noteScroll.Position = UDim2.fromOffset(4, 4)
-	noteScroll.Size = UDim2.new(1, -8, 1, -8)
+	noteScroll.Size = UDim2.new(1, -8, 1, -26)
 	noteScroll.BackgroundTransparency = 1
 	noteScroll.BorderSizePixel = 0
 	noteScroll.ScrollBarThickness = 6
 	noteScroll.ScrollBarImageColor3 = THEME.DIM
-	noteScroll.ScrollingDirection = Enum.ScrollingDirection.XY
-	noteScroll.AutomaticCanvasSize = Enum.AutomaticSize.None
+	noteScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+	noteScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	noteScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 	noteScroll.ClipsDescendants = true
 	noteScroll.Parent = noteHold
 
-	noteLineHi = Instance.new("Frame")
-	noteLineHi.BackgroundColor3 = THEME.LINE
-	noteLineHi.BackgroundTransparency = 0.35
-	noteLineHi.BorderSizePixel = 0
-	noteLineHi.ZIndex = 1
-	noteLineHi.Visible = false
-	noteLineHi.Active = false
-	noteLineHi.Parent = noteScroll
-	corner(noteLineHi, 4)
+	local noteList = Instance.new("Frame")
+	noteList.BackgroundTransparency = 1
+	noteList.Size = UDim2.new(1, -6, 0, 0)
+	noteList.AutomaticSize = Enum.AutomaticSize.Y
+	noteList.Parent = noteScroll
+	local noteLay = Instance.new("UIListLayout")
+	noteLay.SortOrder = Enum.SortOrder.LayoutOrder
+	noteLay.Padding = UDim.new(0, 0)
+	noteLay.Parent = noteList
 
-	noteBox = Instance.new("TextBox")
-	noteBox.Position = UDim2.fromOffset(4, 4)
-	noteBox.Size = UDim2.new(1, -14, 1, 0)
-	noteBox.ZIndex = 3
-	noteBox.BackgroundTransparency = 1
-	noteBox.BorderSizePixel = 0
-	noteBox.ClearTextOnFocus = false
-	noteBox.MultiLine = true
-	noteBox.TextWrapped = false
-	noteBox.TextXAlignment = Enum.TextXAlignment.Left
-	noteBox.TextYAlignment = Enum.TextYAlignment.Top
-	noteBox.Font = Enum.Font.Code
-	noteBox.TextSize = 13
-	noteBox.TextColor3 = THEME.TEXT
-	noteBox.PlaceholderColor3 = THEME.DIM
-	noteBox.PlaceholderText = "out fire(Remote)\nwait(0.50)\nin fire(Other)"
-	noteBox.Text = "-- record, then stop.\n-- Start runs this notepad.\n-- green out = you → server, purple in = game → you (Start skips in).\n-- Click a line, then From here or Fire 1."
-	noteBox.Parent = noteScroll
-
-	noteOverlay = Instance.new("TextLabel")
-	noteOverlay.Position = UDim2.fromOffset(4, 4)
-	noteOverlay.Size = UDim2.new(1, -14, 1, 0)
-	noteOverlay.ZIndex = 2
-	noteOverlay.BackgroundTransparency = 1
-	noteOverlay.BorderSizePixel = 0
-	noteOverlay.RichText = true
-	noteOverlay.TextWrapped = false
-	noteOverlay.Active = false
+	argLab = Instance.new("TextLabel")
+	argLab.Position = UDim2.new(0, 8, 1, -22)
+	argLab.Size = UDim2.new(1, -16, 0, 18)
+	argLab.BackgroundTransparency = 1
+	argLab.Font = Enum.Font.Gotham
+	argLab.TextSize = 11
+	argLab.TextXAlignment = Enum.TextXAlignment.Left
+	argLab.TextColor3 = THEME.DIM
 	pcall(function()
-		noteOverlay.Interactable = false
+		argLab.TextTruncate = Enum.TextTruncate.AtEnd
 	end)
-	noteOverlay.TextXAlignment = Enum.TextXAlignment.Left
-	noteOverlay.TextYAlignment = Enum.TextYAlignment.Top
-	noteOverlay.Font = Enum.Font.Code
-	noteOverlay.TextSize = 13
-	noteOverlay.TextColor3 = THEME.TEXT
-	noteOverlay.Text = ""
-	noteOverlay.Parent = noteScroll
+	argLab.Text = "  recorded args show here when you click a line"
+	argLab.Parent = noteHold
 
-	noteCaret = Instance.new("Frame")
-	noteCaret.BackgroundColor3 = THEME.CARET
-	noteCaret.BorderSizePixel = 0
-	noteCaret.ZIndex = 4
-	noteCaret.Size = UDim2.fromOffset(2, 16)
-	noteCaret.Visible = false
-	noteCaret.Active = false
-	noteCaret.Parent = noteScroll
-
-	local function measure(text)
-		text = tostring(text or "")
-		if text == "" then
-			text = " "
+	rebuildNote = function(grab)
+		commitEdit()
+		if #noteData == 0 then
+			noteData[1] = ""
 		end
-		local ok, sz = pcall(function()
-			return TextService:GetTextSize(text, noteBox.TextSize, noteBox.Font, Vector2.new(10000, 200))
-		end)
-		if ok and typeof(sz) == "Vector2" then
-			return sz
+		if S.editIndex < 1 then
+			S.editIndex = 1
 		end
-		return Vector2.new(#text * 7, 16)
-	end
-
-	local function lineH()
-		local text = tostring(noteBox.Text or "")
-		local n = 1
-		for _ in string.gmatch(text, "\n") do
-			n = n + 1
+		if S.editIndex > #noteData then
+			S.editIndex = #noteData
 		end
-		local h = 16
-		if n > 0 and noteBox.TextBounds.Y > 0 then
-			h = noteBox.TextBounds.Y / n
-		else
-			h = measure("Ag").Y
-		end
-		if h < 14 then
-			h = 16
-		end
-		return h
-	end
-
-	paintCaret = function()
-		if not noteBox or not noteCaret or not noteBox.Parent then
-			return
-		end
-		if noteBox.Text == "" then
-			noteCaret.Visible = false
-			if noteLineHi then
-				noteLineHi.Visible = false
-			end
-			return
-		end
-		local focused = false
-		pcall(function()
-			focused = noteBox:IsFocused()
-		end)
-		local lh = lineH()
-		local line = cursorLine()
-		local y = 4 + (line - 1) * lh
-		if noteLineHi then
-			noteLineHi.Position = UDim2.fromOffset(2, y)
-			noteLineHi.Size = UDim2.new(1, -8, 0, lh)
-			noteLineHi.Visible = true
-		end
-		local prefix = cursorPrefix()
-		local x = 4 + measure(prefix).X
-		if prefix == "" then
-			x = 4
-		end
-		noteCaret.Position = UDim2.fromOffset(x, y)
-		noteCaret.Size = UDim2.fromOffset(2, lh)
-		noteCaret.Visible = focused
-		if focused and noteScroll then
-			local view = noteScroll.AbsoluteWindowSize
-			if view.X < 1 then
-				view = noteScroll.AbsoluteSize
-			end
-			local pos = noteScroll.CanvasPosition
-			local nx, ny = pos.X, pos.Y
-			if y < ny + 4 then
-				ny = math.max(0, y - 4)
-			elseif y + lh > ny + view.Y - 8 then
-				ny = y + lh - view.Y + 8
-			end
-			if x < nx + 4 then
-				nx = math.max(0, x - 4)
-			elseif x > nx + view.X - 16 then
-				nx = x - view.X + 16
-			end
-			if nx ~= pos.X or ny ~= pos.Y then
-				noteScroll.CanvasPosition = Vector2.new(nx, ny)
+		for _, ch in ipairs(noteList:GetChildren()) do
+			if not ch:IsA("UIListLayout") then
+				ch:Destroy()
 			end
 		end
-	end
-
-	local function paintNote()
-		if not noteBox or not noteOverlay or not noteBox.Parent then
-			return
-		end
-		noteOverlay.Size = noteBox.Size
-		if noteBox.Text == "" then
-			noteBox.TextTransparency = 0
-			noteOverlay.Visible = false
-			if noteCaret then
-				noteCaret.Visible = false
-			end
-			if noteLineHi then
-				noteLineHi.Visible = false
-			end
-			return
-		end
-		noteOverlay.Text = colorNote(noteBox.Text)
-		noteOverlay.Visible = true
-		noteBox.TextTransparency = 1
-		paintCaret()
-	end
-
-	local function fitNote()
-		if not noteBox or not noteBox.Parent or not noteScroll.Parent then
-			return
-		end
-		local viewH = noteScroll.AbsoluteWindowSize.Y
-		local viewW = noteScroll.AbsoluteWindowSize.X
-		if viewH < 1 then
-			viewH = noteScroll.AbsoluteSize.Y
-		end
-		if viewW < 1 then
-			viewW = noteScroll.AbsoluteSize.X
-		end
-		local bounds = noteBox.TextBounds
-		local tw = math.max(viewW - 8, bounds.X + 20)
-		local th = math.max(viewH, bounds.Y + 24)
-		noteBox.Size = UDim2.fromOffset(tw, th)
-		if noteOverlay then
-			noteOverlay.Size = UDim2.fromOffset(tw, th)
-		end
-		noteScroll.CanvasSize = UDim2.fromOffset(tw, th)
-		paintNote()
-	end
-	noteBox:GetPropertyChangedSignal("Text"):Connect(fitNote)
-	noteBox:GetPropertyChangedSignal("TextBounds"):Connect(fitNote)
-	noteBox:GetPropertyChangedSignal("CursorPosition"):Connect(function()
-		notePos()
-		paintCaret()
-	end)
-	noteScroll:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitNote)
-	noteBox.Focused:Connect(function()
-		notePos()
-		paintNote()
-	end)
-	noteBox.FocusLost:Connect(function()
-		paintNote()
-	end)
-	later(function()
-		local on = true
-		while noteCaret and noteCaret.Parent and not S.stopped do
-			local focused = false
-			pcall(function()
-				focused = noteBox and noteBox:IsFocused()
-			end)
-			if focused and noteBox and noteBox.Text ~= "" then
-				on = not on
-				noteCaret.Visible = on
-			end
-			if type(task) == "table" and type(task.wait) == "function" then
-				task.wait(0.45)
+		noteBox = nil
+		for i = 1, #noteData do
+			local idx = i
+			local row = Instance.new("Frame")
+			row.Size = UDim2.new(1, 0, 0, LINE_H)
+			row.BackgroundColor3 = THEME.LINE
+			row.BackgroundTransparency = idx == S.editIndex and 0.45 or 1
+			row.BorderSizePixel = 0
+			row.LayoutOrder = idx
+			row.Parent = noteList
+			if idx == S.editIndex then
+				local box = Instance.new("TextBox")
+				box.Size = UDim2.new(1, -8, 1, 0)
+				box.Position = UDim2.fromOffset(4, 0)
+				box.BackgroundTransparency = 1
+				box.BorderSizePixel = 0
+				box.ClearTextOnFocus = false
+				box.TextWrapped = false
+				box.TextXAlignment = Enum.TextXAlignment.Left
+				box.TextYAlignment = Enum.TextYAlignment.Center
+				box.Font = Enum.Font.Code
+				box.TextSize = 13
+				box.TextColor3 = lineColor(noteData[idx])
+				box.Text = noteData[idx]
+				box.Parent = row
+				noteBox = box
+				editSlot = idx
+				box:GetPropertyChangedSignal("Text"):Connect(function()
+					noteData[idx] = box.Text
+					box.TextColor3 = lineColor(box.Text)
+					previewArgs()
+				end)
+				box.FocusLost:Connect(function(enter)
+					noteData[idx] = box.Text
+					if enter then
+						table.insert(noteData, idx + 1, "")
+						S.editIndex = idx + 1
+						rebuildNote(true)
+					else
+						previewArgs()
+					end
+				end)
+				box.InputBegan:Connect(function(input)
+					if input.UserInputType ~= Enum.UserInputType.Keyboard then
+						return
+					end
+					if input.KeyCode == Enum.KeyCode.Up then
+						noteData[idx] = box.Text
+						if S.editIndex > 1 then
+							S.editIndex = S.editIndex - 1
+							rebuildNote(true)
+						end
+					elseif input.KeyCode == Enum.KeyCode.Down then
+						noteData[idx] = box.Text
+						if S.editIndex < #noteData then
+							S.editIndex = S.editIndex + 1
+							rebuildNote(true)
+						end
+					elseif input.KeyCode == Enum.KeyCode.Backspace then
+						if box.Text == "" and #noteData > 1 then
+							table.remove(noteData, idx)
+							if S.editIndex > #noteData then
+								S.editIndex = #noteData
+							elseif idx > 1 then
+								S.editIndex = idx - 1
+							end
+							rebuildNote(true)
+						end
+					end
+				end)
 			else
-				wait(0.45)
+				local btn = Instance.new("TextButton")
+				btn.Size = UDim2.new(1, -8, 1, 0)
+				btn.Position = UDim2.fromOffset(4, 0)
+				btn.BackgroundTransparency = 1
+				btn.BorderSizePixel = 0
+				btn.AutoButtonColor = false
+				btn.TextWrapped = false
+				btn.TextXAlignment = Enum.TextXAlignment.Left
+				btn.TextYAlignment = Enum.TextYAlignment.Center
+				btn.Font = Enum.Font.Code
+				btn.TextSize = 13
+				btn.TextColor3 = lineColor(noteData[idx])
+				btn.Text = noteData[idx]
+				btn.Parent = row
+				btn.MouseButton1Click:Connect(function()
+					commitEdit()
+					S.editIndex = idx
+					rebuildNote(true)
+				end)
 			end
 		end
-	end)
-	task.defer(fitNote)
+		previewArgs()
+		if grab and noteBox then
+			later(function()
+				if noteBox then
+					pcall(function()
+						noteBox:CaptureFocus()
+					end)
+				end
+			end)
+			if noteScroll then
+				local y = (S.editIndex - 1) * LINE_H - 40
+				if y < 0 then
+					y = 0
+				end
+				noteScroll.CanvasPosition = Vector2.new(0, y)
+			end
+		end
+	end
+	rebuildNote(false)
 
 	logLabel = Instance.new("TextLabel")
 	logLabel.Position = UDim2.new(0, 12, 1, -40)
@@ -1900,7 +2089,7 @@ local function createGui()
 	logLabel.TextXAlignment = Enum.TextXAlignment.Left
 	logLabel.TextColor3 = THEME.DIM
 	logLabel.TextWrapped = true
-	logLabel.Text = "  x = how many times to run. x gap = pause between those runs. Click a line, then From here or Fire 1."
+	logLabel.Text = "  Click a notepad line to edit. Lua copies a real FireServer script with the recorded args."
 	logLabel.Parent = win
 	corner(logLabel, 6)
 
