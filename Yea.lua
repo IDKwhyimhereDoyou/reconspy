@@ -40,9 +40,10 @@ local S = {
 	inConns = {},
 	listDirty = false,
 	lastPaint = 0,
+	stopReplay = false,
 }
 
-local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, repeatBox
+local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, repeatBox, gapBox
 local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
 
@@ -206,6 +207,16 @@ local function cloneArg(v)
 end
 
 local function pause(sec)
+	sec = tonumber(sec) or 0
+	if sec < 0 then
+		sec = 0
+	end
+	if sec > 8 then
+		sec = 8
+	end
+	if sec < 0.03 then
+		sec = 0.03
+	end
 	if type(task) == "table" and type(task.wait) == "function" then
 		task.wait(sec)
 	else
@@ -255,15 +266,48 @@ local function scriptFromTake(take)
 end
 
 local function clipSet(text)
-	local fn = pickFn("setclipboard", "toclipboard", "set_clipboard")
-	if type(fn) == "function" then
-		return pcall(fn, text)
+	text = tostring(text or "")
+	local names = {
+		"setclipboard",
+		"toclipboard",
+		"set_clipboard",
+		"writeclipboard",
+		"setrbxclipboard",
+	}
+	for i = 1, #names do
+		local fn = pickFn(names[i])
+		if type(fn) == "function" then
+			local ok = pcall(fn, text)
+			if ok then
+				return true
+			end
+		end
+	end
+	local syn = envGet("syn")
+	if type(syn) == "table" then
+		if type(syn.write_clipboard) == "function" then
+			local ok = pcall(syn.write_clipboard, text)
+			if ok then
+				return true
+			end
+		end
+		if type(syn.set_clipboard) == "function" then
+			local ok = pcall(syn.set_clipboard, text)
+			if ok then
+				return true
+			end
+		end
 	end
 	local clip = envGet("Clipboard")
 	if type(clip) == "table" and type(clip.set) == "function" then
-		return pcall(clip.set, text)
+		local ok = pcall(clip.set, text)
+		if ok then
+			return true
+		end
 	end
+	print("-------- ActionSpy script --------")
 	print(text)
+	print("-------- end --------")
 	return false
 end
 
@@ -668,9 +712,77 @@ local function fireEvent(ev)
 	return false, "skip"
 end
 
+local function finishReplay(msg, color)
+	S.replaying = false
+	S.stopReplay = false
+	if startBtn then
+		startBtn.Text = "Start"
+		startBtn.BackgroundColor3 = THEME.OK
+	end
+	if msg then
+		log(msg, color)
+	end
+end
+
+local function runReplay(take, steps, loops, loopGap)
+	local fired, failed, skipped = 0, 0, 0
+	for loop = 1, loops do
+		if S.stopReplay or S.stopped then
+			break
+		end
+		local used = {}
+		for s = 1, #steps do
+			if S.stopReplay or S.stopped then
+				break
+			end
+			local step = steps[s]
+			if step.kind == "wait" then
+				pause(step.t or 0.03)
+			elseif step.inbound then
+				skipped = skipped + 1
+			else
+				local ev = claimEvent(take, used, step.name, false)
+				if not ev then
+					failed = failed + 1
+				else
+					if step.invoke then
+						ev = {
+							remote = ev.remote,
+							path = ev.path,
+							name = ev.name,
+							method = "InvokeServer",
+							packed = ev.packed,
+						}
+					end
+					local ok = fireEvent(ev)
+					if ok then
+						fired = fired + 1
+					else
+						failed = failed + 1
+					end
+					pause(0.05)
+				end
+			end
+		end
+		if loop < loops and not S.stopReplay then
+			pause(loopGap)
+		end
+	end
+	local extra = S.stopReplay and " Stopped." or ""
+	finishReplay(
+		string.format("Done.%s fired %d outbound, skipped %d inbound, failed %d.", extra, fired, skipped, failed),
+		failed > 0 and THEME.ERR or THEME.OK
+	)
+end
+
 local function doStart()
 	if S.recording then
 		log("Stop recording first (press Record again).", THEME.WARN)
+		return
+	end
+	if S.replaying then
+		S.stopReplay = true
+		log("Stopping…", THEME.WARN)
 		return
 	end
 	local take = S.saved
@@ -703,7 +815,6 @@ local function doStart()
 				invoke = ev.method == "InvokeServer",
 			}
 		end
-		log("Notepad had no outbound fire() lines — replaying the recording as saved.", THEME.WARN)
 	end
 	local loops = 1
 	if repeatBox then
@@ -712,73 +823,44 @@ local function doStart()
 	if loops < 1 then
 		loops = 1
 	end
-	if loops > 20 then
-		loops = 20
+	if loops > 8 then
+		loops = 8
+	end
+	local loopGap = 0.6
+	if gapBox then
+		loopGap = tonumber(gapBox.Text) or 0.6
+	end
+	if loopGap < 0.3 then
+		loopGap = 0.3
+	end
+	if loopGap > 8 then
+		loopGap = 8
 	end
 	S.replaying = true
+	S.stopReplay = false
 	if startBtn then
-		startBtn.Text = "…"
-		startBtn.BackgroundColor3 = THEME.WARN
+		startBtn.Text = "Stop"
+		startBtn.BackgroundColor3 = THEME.ERR
 	end
-	local fired, failed, skipped = 0, 0, 0
-	for _ = 1, loops do
-		local used = {}
-		for s = 1, #steps do
-			local step = steps[s]
-			if step.kind == "wait" then
-				local t = step.t or 0
-				if t > 0.001 then
-					pause(math.min(t, 5))
-				end
-			elseif step.inbound then
-				skipped = skipped + 1
-			else
-				local ev = claimEvent(take, used, step.name, false)
-				if not ev then
-					failed = failed + 1
-					log("No recorded outbound args for fire(" .. tostring(step.name) .. "). Name must match a recorded outbound remote.", THEME.ERR)
-				else
-					if step.invoke then
-						ev = {
-							remote = ev.remote,
-							path = ev.path,
-							name = ev.name,
-							method = "InvokeServer",
-							packed = ev.packed,
-						}
-					end
-					local ok, err = fireEvent(ev)
-					if ok then
-						fired = fired + 1
-					else
-						failed = failed + 1
-						log("Failed " .. tostring(step.name) .. ": " .. tostring(err), THEME.ERR)
-					end
-				end
-			end
-		end
-		if loops > 1 then
-			pause(0.15)
-		end
-	end
-	S.replaying = false
-	if startBtn then
-		startBtn.Text = "Start"
-		startBtn.BackgroundColor3 = THEME.OK
-	end
-	log(string.format("Notepad run. fired %d outbound, skipped %d inbound, failed %d.", fired, skipped, failed), failed > 0 and THEME.ERR or THEME.OK)
+	log("Running notepad x" .. tostring(loops) .. " (gap " .. tostring(loopGap) .. "s). Click Stop to halt.", THEME.OK)
+	later(function()
+		runReplay(take, steps, loops, loopGap)
+	end)
 end
 
 local function doCopy()
-	local text = noteBox and noteBox.Text or ""
-	if text == "" then
-		log("Notepad is empty.", THEME.WARN)
+	local body = noteBox and noteBox.Text or ""
+	if body == "" or string.find(body, "nothing recorded", 1, true) then
+		log("Notepad is empty. Record first.", THEME.WARN)
 		return
 	end
-	if clipSet(text) then
-		log("Copied notepad.", THEME.OK)
+	local script = "-- ActionSpy script (edit + Start in the GUI, or keep as notes)\n"
+		.. "-- out = you → game   in = game → you (Start skips in)\n\n"
+		.. body
+	if clipSet(script) then
+		log("Copied script to clipboard.", THEME.OK)
 	else
-		log("No clipboard. Notepad printed in F9.", THEME.WARN)
+		log("Clipboard blocked. Script printed in F9 console.", THEME.WARN)
 	end
 end
 
@@ -817,6 +899,7 @@ end
 local function destroyGui()
 	S.stopped = true
 	S.recording = false
+	S.stopReplay = true
 	stopInbound()
 	if f10Conn then
 		pcall(function()
@@ -936,15 +1019,15 @@ local function createGui()
 	bar.Size = UDim2.new(1, -24, 0, 32)
 	bar.Parent = win
 
-	recBtn = mkBtn(bar, "Record", 0, 88, THEME.BTN, toggleRecord)
-	startBtn = mkBtn(bar, "Start", 96, 88, THEME.OK, doStart)
-	mkBtn(bar, "Copy", 192, 64, THEME.BTN, doCopy)
-	mkBtn(bar, "Reset", 264, 64, THEME.BTN, doReset)
+	recBtn = mkBtn(bar, "Record", 0, 80, THEME.BTN, toggleRecord)
+	startBtn = mkBtn(bar, "Start", 88, 80, THEME.OK, doStart)
+	mkBtn(bar, "Copy", 176, 64, THEME.BTN, doCopy)
+	mkBtn(bar, "Reset", 248, 64, THEME.BTN, doReset)
 
 	local timesLab = Instance.new("TextLabel")
 	timesLab.BackgroundTransparency = 1
-	timesLab.Position = UDim2.fromOffset(336, 0)
-	timesLab.Size = UDim2.fromOffset(36, 32)
+	timesLab.Position = UDim2.fromOffset(318, 0)
+	timesLab.Size = UDim2.fromOffset(18, 32)
 	timesLab.Font = Enum.Font.Gotham
 	timesLab.TextSize = 12
 	timesLab.TextXAlignment = Enum.TextXAlignment.Right
@@ -953,8 +1036,8 @@ local function createGui()
 	timesLab.Parent = bar
 
 	repeatBox = Instance.new("TextBox")
-	repeatBox.Size = UDim2.fromOffset(40, 32)
-	repeatBox.Position = UDim2.fromOffset(376, 0)
+	repeatBox.Size = UDim2.fromOffset(36, 32)
+	repeatBox.Position = UDim2.fromOffset(340, 0)
 	repeatBox.BackgroundColor3 = THEME.PANEL
 	repeatBox.BorderSizePixel = 0
 	repeatBox.Font = Enum.Font.GothamMedium
@@ -964,6 +1047,30 @@ local function createGui()
 	repeatBox.ClearTextOnFocus = false
 	repeatBox.Parent = bar
 	corner(repeatBox, 8)
+
+	local gapLab = Instance.new("TextLabel")
+	gapLab.BackgroundTransparency = 1
+	gapLab.Position = UDim2.fromOffset(382, 0)
+	gapLab.Size = UDim2.fromOffset(28, 32)
+	gapLab.Font = Enum.Font.Gotham
+	gapLab.TextSize = 11
+	gapLab.TextXAlignment = Enum.TextXAlignment.Right
+	gapLab.TextColor3 = THEME.DIM
+	gapLab.Text = "gap"
+	gapLab.Parent = bar
+
+	gapBox = Instance.new("TextBox")
+	gapBox.Size = UDim2.fromOffset(44, 32)
+	gapBox.Position = UDim2.fromOffset(414, 0)
+	gapBox.BackgroundColor3 = THEME.PANEL
+	gapBox.BorderSizePixel = 0
+	gapBox.Font = Enum.Font.GothamMedium
+	gapBox.TextSize = 13
+	gapBox.TextColor3 = THEME.TEXT
+	gapBox.Text = "0.6"
+	gapBox.ClearTextOnFocus = false
+	gapBox.Parent = bar
+	corner(gapBox, 8)
 
 	local listHold = Instance.new("Frame")
 	listHold.Position = UDim2.fromOffset(12, 96)
