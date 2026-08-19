@@ -18,6 +18,7 @@ local THEME = {
 	WARN = Color3.fromRGB(255, 176, 64),
 	ERR = Color3.fromRGB(232, 78, 78),
 	OK = Color3.fromRGB(72, 196, 128),
+	OUT = Color3.fromRGB(72, 196, 128),
 	IN = Color3.fromRGB(160, 140, 255),
 }
 
@@ -27,6 +28,9 @@ local NOISY = {
 	"positionupdate", "cframe", "syncpos", "characterlook", "getping",
 	"updatemouse", "physics", "collision", "cameramove", "stream",
 	"byte", "ack", "keepalive", "keep_alive", "clock",
+	"livetime", "getlivetime", "getthelivetime", "servertime", "clienttime",
+	"gettime", "osclock", "timestamp", "timesync", "synctime", "unixtime",
+	"worldtime", "networktime", "remotetime", "servertick", "clienttick",
 }
 
 local S = {
@@ -43,7 +47,7 @@ local S = {
 	stopReplay = false,
 }
 
-local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, repeatBox, gapBox
+local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, noteOverlay, repeatBox, gapBox
 local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
 local resizing, resizeStart, startSize
@@ -131,14 +135,59 @@ local function trunc(s, n)
 	return string.sub(s, 1, n - 1) .. "…"
 end
 
+local function compactName(name)
+	return string.lower((string.gsub(tostring(name or ""), "[^%a%d]", "")))
+end
+
 local function isNoisy(name)
-	local n = string.lower(tostring(name or ""))
+	local raw = string.lower(tostring(name or ""))
+	local compact = compactName(name)
 	for i = 1, #NOISY do
-		if string.find(n, NOISY[i], 1, true) then
+		local tok = NOISY[i]
+		if string.find(raw, tok, 1, true) or string.find(compact, tok, 1, true) then
 			return true
 		end
 	end
+	if string.find(compact, "live", 1, true) and string.find(compact, "time", 1, true) then
+		return true
+	end
 	return false
+end
+
+local function rgbTag(c)
+	return string.format(
+		"rgb(%d,%d,%d)",
+		math.floor(c.R * 255 + 0.5),
+		math.floor(c.G * 255 + 0.5),
+		math.floor(c.B * 255 + 0.5)
+	)
+end
+
+local function escapeRich(s)
+	s = string.gsub(tostring(s or ""), "&", "&amp;")
+	s = string.gsub(s, "<", "&lt;")
+	s = string.gsub(s, ">", "&gt;")
+	return s
+end
+
+local function colorNote(text)
+	local chunks = {}
+	text = tostring(text or "") .. "\n"
+	for line in string.gmatch(text, "(.-)\n") do
+		local low = string.lower(line)
+		local col = THEME.TEXT
+		if string.match(low, "^%s*%-%-") or line == "" then
+			col = THEME.DIM
+		elseif string.match(low, "^%s*in[%s%p]") then
+			col = THEME.IN
+		elseif string.match(low, "^%s*out[%s%p]") then
+			col = THEME.OUT
+		elseif string.match(low, "^%s*wait%s*%(") then
+			col = THEME.WARN
+		end
+		chunks[#chunks + 1] = '<font color="' .. rgbTag(col) .. '">' .. escapeRich(line) .. "</font>"
+	end
+	return table.concat(chunks, "<br/>")
 end
 
 local function splitDot(s)
@@ -410,7 +459,7 @@ local function refreshList()
 		row.Font = Enum.Font.Gotham
 		row.TextSize = 12
 		row.TextXAlignment = Enum.TextXAlignment.Left
-		row.TextColor3 = ev.inbound and THEME.IN or THEME.TEXT
+		row.TextColor3 = ev.inbound and THEME.IN or THEME.OUT
 		row.Text = "  " .. trunc(ev.label, 70)
 		row.Parent = listFrame
 	end
@@ -457,6 +506,54 @@ local function packSelect(...)
 	return packed
 end
 
+local function dropSpamNamed(key)
+	if not S.live then
+		return
+	end
+	S.live.spam = S.live.spam or {}
+	S.live.spam[key] = true
+	local src = S.live.events
+	local dst = {}
+	for i = 1, #src do
+		if string.lower(tostring(src[i].name or "")) ~= key then
+			dst[#dst + 1] = src[i]
+		end
+	end
+	S.live.events = dst
+end
+
+local function tooFast(name)
+	local key = string.lower(tostring(name or ""))
+	if key == "" then
+		return false
+	end
+	S.live.spam = S.live.spam or {}
+	if S.live.spam[key] then
+		return true
+	end
+	S.live.hits = S.live.hits or {}
+	local hits = S.live.hits[key]
+	if not hits then
+		hits = {}
+		S.live.hits[key] = hits
+	end
+	local now = os.clock()
+	hits[#hits + 1] = now
+	local n = 0
+	for i = #hits, 1, -1 do
+		if now - hits[i] <= 0.6 then
+			n = n + 1
+		else
+			break
+		end
+	end
+	if n >= 5 then
+		dropSpamNamed(key)
+		return true
+	end
+	return false
+end
+
 local function addCaptured(remote, method, inbound, packed)
 	if S.replaying or S.stopped or not S.recording or not S.live then
 		return
@@ -471,14 +568,13 @@ local function addCaptured(remote, method, inbound, packed)
 	pcall(function()
 		name = remote.Name
 	end)
-	if isNoisy(name) then
+	if isNoisy(name) or tooFast(name) then
 		return
 	end
 	local now = os.clock()
 	if S.t0 == 0 then
 		S.t0 = now
 	end
-	local n = packed.n or 0
 	local ev = {
 		delay = now - S.t0,
 		method = method,
@@ -487,7 +583,7 @@ local function addCaptured(remote, method, inbound, packed)
 		name = name,
 		path = name,
 		packed = packed,
-		label = string.format("+%.2fs  %s  %s", now - S.t0, inbound and "← client" or "→ server", name),
+		label = string.format("+%.2fs  %s  %s", now - S.t0, inbound and "in" or "out", name),
 	}
 	S.live.events[#S.live.events + 1] = ev
 	schedulePaint()
@@ -614,7 +710,7 @@ local function startRecord()
 	end
 	S.recording = true
 	S.t0 = 0
-	S.live = { events = {} }
+	S.live = { events = {}, spam = {}, hits = {} }
 	S.lastPaint = 0
 	if recBtn then
 		recBtn.Text = "Stop"
@@ -1130,6 +1226,7 @@ local function createGui()
 	noteBox = Instance.new("TextBox")
 	noteBox.Position = UDim2.fromOffset(4, 4)
 	noteBox.Size = UDim2.new(1, -14, 1, 0)
+	noteBox.ZIndex = 2
 	noteBox.BackgroundTransparency = 1
 	noteBox.BorderSizePixel = 0
 	noteBox.ClearTextOnFocus = false
@@ -1142,8 +1239,43 @@ local function createGui()
 	noteBox.TextColor3 = THEME.TEXT
 	noteBox.PlaceholderColor3 = THEME.DIM
 	noteBox.PlaceholderText = "out fire(Remote)\nwait(0.50)\nin fire(Other)"
-	noteBox.Text = "-- record, then stop.\n-- Start runs this notepad.\n-- out = you → server, in = game → you (Start skips in).\n-- Delete a line to skip it. Change wait()."
+	noteBox.Text = "-- record, then stop.\n-- Start runs this notepad.\n-- green out = you → server, purple in = game → you (Start skips in).\n-- Delete a line to skip it. Change wait()."
 	noteBox.Parent = noteScroll
+
+	noteOverlay = Instance.new("TextLabel")
+	noteOverlay.Position = UDim2.fromOffset(4, 4)
+	noteOverlay.Size = UDim2.new(1, -14, 1, 0)
+	noteOverlay.ZIndex = 1
+	noteOverlay.BackgroundTransparency = 1
+	noteOverlay.BorderSizePixel = 0
+	noteOverlay.RichText = true
+	noteOverlay.TextWrapped = true
+	noteOverlay.TextXAlignment = Enum.TextXAlignment.Left
+	noteOverlay.TextYAlignment = Enum.TextYAlignment.Top
+	noteOverlay.Font = Enum.Font.Code
+	noteOverlay.TextSize = 13
+	noteOverlay.TextColor3 = THEME.TEXT
+	noteOverlay.Text = ""
+	noteOverlay.Parent = noteScroll
+
+	local function paintNote()
+		if not noteBox or not noteOverlay or not noteBox.Parent then
+			return
+		end
+		noteOverlay.Size = noteBox.Size
+		local focused = false
+		pcall(function()
+			focused = noteBox:IsFocused()
+		end)
+		if focused or noteBox.Text == "" then
+			noteBox.TextTransparency = 0
+			noteOverlay.Visible = false
+			return
+		end
+		noteOverlay.Text = colorNote(noteBox.Text)
+		noteOverlay.Visible = true
+		noteBox.TextTransparency = 1
+	end
 
 	local function fitNote()
 		if not noteBox or not noteBox.Parent or not noteScroll.Parent then
@@ -1158,11 +1290,17 @@ local function createGui()
 			th = viewH
 		end
 		noteBox.Size = UDim2.new(1, -14, 0, th)
+		if noteOverlay then
+			noteOverlay.Size = UDim2.new(1, -14, 0, th)
+		end
 		noteScroll.CanvasSize = UDim2.new(0, 0, 0, th)
+		paintNote()
 	end
 	noteBox:GetPropertyChangedSignal("Text"):Connect(fitNote)
 	noteBox:GetPropertyChangedSignal("TextBounds"):Connect(fitNote)
 	noteScroll:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitNote)
+	noteBox.Focused:Connect(paintNote)
+	noteBox.FocusLost:Connect(paintNote)
 	task.defer(fitNote)
 
 	logLabel = Instance.new("TextLabel")
@@ -1175,7 +1313,7 @@ local function createGui()
 	logLabel.TextXAlignment = Enum.TextXAlignment.Left
 	logLabel.TextColor3 = THEME.DIM
 	logLabel.TextWrapped = true
-	logLabel.Text = "  Record → stop. Edit notepad (out/in, wait). Start runs it. Drag corner to resize. F10 closes."
+	logLabel.Text = "  Green = outbound, purple = inbound. Clock/live-time spam is ignored. Drag corner to resize."
 	logLabel.Parent = win
 	corner(logLabel, 6)
 
