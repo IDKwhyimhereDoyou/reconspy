@@ -7,7 +7,9 @@ local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
 local lp = Players.LocalPlayer
+local unpack = unpack or table.unpack
 
 local THEME = {
 	BG = Color3.fromRGB(16, 16, 20),
@@ -23,6 +25,8 @@ local THEME = {
 	SEL = Color3.fromRGB(56, 56, 88),
 	CARET = Color3.fromRGB(255, 214, 102),
 	LINE = Color3.fromRGB(48, 52, 78),
+	STROKE = Color3.fromRGB(58, 58, 72),
+	HOVER = Color3.fromRGB(52, 52, 66),
 }
 
 local NOISY = {
@@ -51,18 +55,22 @@ local S = {
 	selected = {},
 	backup = nil,
 	editIndex = 1,
+	listFilter = "",
+	minimized = false,
+	listW = 280,
 }
 
 local LINE_H = 18
-local noteData = { "-- record, then stop.", "-- Start runs this notepad. Lua copies a real FireServer script.", "-- Click a line to edit. Enter = new line. Empty + Backspace = delete." }
+local noteData = { "-- record, then stop.", "-- Click a line to edit. Enter = new line. Empty + Backspace = delete." }
 local editSlot = 1
+local noteRowFrames = {}
 
 local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, noteScroll, argLab
-local repeatBox, gapBox, waitAllBox
+local repeatBox, gapBox, waitAllBox, filterBox, statusLab, listHold, noteHold, splitBar
 local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
-local resizing, resizeStart, startSize
-local rebuildNote
+local resizing, resizeStart, startSize, splitting, splitStart, splitW
+local rebuildNote, layoutPanels, markPlayLine
 
 local function envGet(name)
 	if type(getgenv) == "function" then
@@ -136,6 +144,47 @@ local function corner(inst, r)
 	local c = Instance.new("UICorner")
 	c.CornerRadius = UDim.new(0, r or 8)
 	c.Parent = inst
+end
+
+local function stroke(inst, col, thick)
+	local ok, s = pcall(function()
+		local u = Instance.new("UIStroke")
+		u.Color = col or THEME.STROKE
+		u.Thickness = thick or 1
+		u.Parent = inst
+		return u
+	end)
+	if ok then
+		return s
+	end
+end
+
+local function tween(inst, props, t)
+	if not inst then
+		return
+	end
+	pcall(function()
+		TweenService:Create(
+			inst,
+			TweenInfo.new(t or 0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			props
+		):Play()
+	end)
+end
+
+local function isInst(v)
+	local ok, r = pcall(function()
+		return typeof(v) == "Instance"
+	end)
+	return ok and r == true
+end
+
+local function paintBtn(b, color)
+	if not b then
+		return
+	end
+	b._base = color
+	tween(b, { BackgroundColor3 = color }, 0.12)
 end
 
 local function trunc(s, n)
@@ -219,11 +268,11 @@ local function fromPath(full)
 end
 
 local function findRemote(ev)
-	if typeof(ev.remote) == "Instance" and ev.remote.Parent then
+	if isInst(ev.remote) and ev.remote.Parent then
 		return ev.remote
 	end
 	local byPath = fromPath(ev.path)
-	if typeof(byPath) == "Instance" then
+	if isInst(byPath) then
 		return byPath
 	end
 	local found
@@ -419,6 +468,18 @@ local function log(msg, color)
 		logLabel.TextColor3 = color or THEME.DIM
 	end
 	print("[ActionSpy] " .. tostring(msg))
+	if statusLab then
+		if S.recording then
+			statusLab.Text = "REC  " .. (S.live and #S.live.events or 0)
+			statusLab.TextColor3 = THEME.ERR
+		elseif S.replaying then
+			statusLab.Text = "PLAY"
+			statusLab.TextColor3 = THEME.OK
+		else
+			statusLab.Text = "idle"
+			statusLab.TextColor3 = THEME.DIM
+		end
+	end
 end
 
 local function scriptFromTake(take)
@@ -648,6 +709,9 @@ local function splitNote(text)
 	if #t == 0 then
 		t[1] = ""
 	end
+	while #t > 1 and t[#t] == "" do
+		t[#t] = nil
+	end
 	return t
 end
 
@@ -732,7 +796,7 @@ local function previewArgs()
 		end
 	end
 	if not idx then
-		argLab.Text = "  click a line · Enter new line · empty Backspace deletes · Lua copies FireServer"
+		argLab.Text = "  click a line · Enter new line · empty Backspace deletes"
 		argLab.TextColor3 = THEME.DIM
 		return
 	end
@@ -743,7 +807,7 @@ local function previewArgs()
 		return
 	end
 	if step.inbound then
-		argLab.Text = "  in " .. tostring(step.name) .. "  (game → you, Start/Lua skip this)"
+		argLab.Text = "  in " .. tostring(step.name) .. "  (game → you, Start skips this)"
 		argLab.TextColor3 = THEME.IN
 		return
 	end
@@ -776,6 +840,33 @@ local function previewArgs()
 	argLab.TextColor3 = THEME.OUT
 end
 
+markPlayLine = function(line)
+	line = tonumber(line)
+	if not line then
+		return
+	end
+	S.editIndex = line
+	for i = 1, #noteRowFrames do
+		local row = noteRowFrames[i]
+		if row and row.Parent then
+			if i == line then
+				row.BackgroundColor3 = THEME.CARET
+				row.BackgroundTransparency = 0.55
+			else
+				row.BackgroundColor3 = THEME.LINE
+				row.BackgroundTransparency = 1
+			end
+		end
+	end
+	if noteScroll then
+		local y = (line - 1) * LINE_H - 40
+		if y < 0 then
+			y = 0
+		end
+		noteScroll.CanvasPosition = Vector2.new(0, y)
+	end
+end
+
 local function refreshList()
 	if not listFrame then
 		return
@@ -799,40 +890,66 @@ local function refreshList()
 		return
 	end
 	local maxShow = math.min(#take.events, 80)
-	for i = 1, maxShow do
+	local shown = 0
+	local filt = string.lower(tostring(S.listFilter or ""))
+	for i = 1, #take.events do
+		if shown >= maxShow then
+			break
+		end
 		local ev = take.events[i]
-		local key = typeKey(ev.inbound, ev.name)
-		local on = S.selected[key] == true
-		local row = Instance.new("TextButton")
-		row.Size = UDim2.new(1, -4, 0, 18)
-		row.BackgroundColor3 = THEME.SEL
-		row.BackgroundTransparency = on and 0.25 or 1
-		row.BorderSizePixel = 0
-		row.AutoButtonColor = false
-		row.Font = Enum.Font.Gotham
-		row.TextSize = 12
-		row.TextXAlignment = Enum.TextXAlignment.Left
-		row.TextColor3 = ev.inbound and THEME.IN or THEME.OUT
-		row.Text = "  " .. trunc(ev.label, 70)
-		row.Parent = listFrame
-		row.MouseButton1Click:Connect(function()
-			if S.recording or S.replaying then
-				return
-			end
-			if ctrlHeld() then
-				if S.selected[key] then
-					S.selected[key] = nil
-				else
-					S.selected[key] = true
+		if filt == "" or string.find(string.lower(tostring(ev.name or "")), filt, 1, true) then
+			shown = shown + 1
+			local key = typeKey(ev.inbound, ev.name)
+			local on = S.selected[key] == true
+			local row = Instance.new("TextButton")
+			row.Size = UDim2.new(1, -4, 0, 18)
+			row.BackgroundColor3 = THEME.SEL
+			row.BackgroundTransparency = on and 0.25 or 1
+			row.BorderSizePixel = 0
+			row.AutoButtonColor = false
+			row.Font = Enum.Font.Gotham
+			row.TextSize = 12
+			row.TextXAlignment = Enum.TextXAlignment.Left
+			row.TextColor3 = ev.inbound and THEME.IN or THEME.OUT
+			row.Text = "  " .. trunc(ev.label, 70)
+			row.Parent = listFrame
+			row.MouseEnter:Connect(function()
+				if not on then
+					tween(row, { BackgroundTransparency = 0.7 }, 0.08)
 				end
-			else
-				S.selected = { [key] = true }
-				jumpNoteToKey(key)
-			end
-			refreshList()
-		end)
+			end)
+			row.MouseLeave:Connect(function()
+				tween(row, { BackgroundTransparency = on and 0.25 or 1 }, 0.1)
+			end)
+			row.MouseButton1Click:Connect(function()
+				if S.recording or S.replaying then
+					return
+				end
+				if ctrlHeld() then
+					if S.selected[key] then
+						S.selected[key] = nil
+					else
+						S.selected[key] = true
+					end
+				else
+					S.selected = { [key] = true }
+					jumpNoteToKey(key)
+				end
+				refreshList()
+			end)
+		end
 	end
-	if #take.events > maxShow then
+	if shown == 0 then
+		local empty = Instance.new("TextLabel")
+		empty.Size = UDim2.new(1, -4, 0, 22)
+		empty.BackgroundTransparency = 1
+		empty.Font = Enum.Font.Gotham
+		empty.TextSize = 12
+		empty.TextXAlignment = Enum.TextXAlignment.Left
+		empty.TextColor3 = THEME.DIM
+		empty.Text = filt ~= "" and "  No remotes match that filter." or "  Nothing saved yet."
+		empty.Parent = listFrame
+	elseif #take.events > maxShow then
 		local more = Instance.new("TextLabel")
 		more.Size = UDim2.new(1, -4, 0, 18)
 		more.BackgroundTransparency = 1
@@ -840,7 +957,7 @@ local function refreshList()
 		more.TextSize = 12
 		more.TextXAlignment = Enum.TextXAlignment.Left
 		more.TextColor3 = THEME.DIM
-		more.Text = "  … +" .. tostring(#take.events - maxShow) .. " more (full order is in the notepad)"
+		more.Text = "  … +" .. tostring(#take.events - shown) .. " more"
 		more.Parent = listFrame
 	end
 end
@@ -850,6 +967,10 @@ local function schedulePaint()
 		if logLabel and logLabel.Parent then
 			logLabel.Text = "  Recording… " .. tostring(#S.live.events) .. " remotes (notepad fills when you stop)"
 			logLabel.TextColor3 = THEME.DIM
+		end
+		if statusLab then
+			statusLab.Text = "REC  " .. tostring(#S.live.events)
+			statusLab.TextColor3 = THEME.ERR
 		end
 		return
 	end
@@ -892,6 +1013,9 @@ local function dropSpamNamed(key)
 end
 
 local function tooFast(name)
+	if not S.live then
+		return false
+	end
 	local key = string.lower(tostring(name or ""))
 	if key == "" then
 		return false
@@ -908,6 +1032,14 @@ local function tooFast(name)
 	end
 	local now = os.clock()
 	hits[#hits + 1] = now
+	if #hits > 24 then
+		local keep = {}
+		for i = #hits - 15, #hits do
+			keep[#keep + 1] = hits[i]
+		end
+		hits = keep
+		S.live.hits[key] = hits
+	end
 	local n = 0
 	for i = #hits, 1, -1 do
 		if now - hits[i] <= 0.6 then
@@ -927,7 +1059,7 @@ local function addCaptured(remote, method, inbound, packed)
 	if S.replaying or S.stopped or not S.recording or not S.live then
 		return
 	end
-	if typeof(remote) ~= "Instance" then
+	if not isInst(remote) then
 		return
 	end
 	if #S.live.events >= 250 then
@@ -1030,10 +1162,16 @@ local function startInbound()
 	stopInbound()
 	local n = 0
 	local function consider(inst)
-		if n >= 40 or typeof(inst) ~= "Instance" then
+		if n >= 40 or not isInst(inst) then
 			return
 		end
-		if not inst:IsA("RemoteEvent") and not inst:IsA("UnreliableRemoteEvent") then
+		local okRe, isRe = pcall(function()
+			return inst:IsA("RemoteEvent")
+		end)
+		local okUr, isUr = pcall(function()
+			return inst:IsA("UnreliableRemoteEvent")
+		end)
+		if not ((okRe and isRe) or (okUr and isUr)) then
 			return
 		end
 		if isNoisy(inst.Name) then
@@ -1084,11 +1222,9 @@ local function startRecord()
 	S.lastPaint = 0
 	if recBtn then
 		recBtn.Text = "Stop"
-		recBtn.BackgroundColor3 = THEME.ERR
+		paintBtn(recBtn, THEME.ERR)
 	end
-	if noteBox then
-		setNoteText("-- recording…")
-	end
+	setNoteText("-- recording…")
 	refreshList()
 	log("Listening (" .. tostring(how) .. "). Do the action, then press Record again to save.", THEME.OK)
 	later(startInbound)
@@ -1103,7 +1239,7 @@ local function stopRecord()
 	S.backup = copyTake(S.saved)
 	if recBtn then
 		recBtn.Text = "Record"
-		recBtn.BackgroundColor3 = THEME.BTN
+		paintBtn(recBtn, THEME.BTN)
 	end
 	local take = S.saved
 	local out, inn = 0, 0
@@ -1116,7 +1252,7 @@ local function stopRecord()
 				out = out + 1
 			end
 			pcall(function()
-				if typeof(ev.remote) == "Instance" then
+				if isInst(ev.remote) then
 					ev.path = ev.remote:GetFullName()
 				end
 			end)
@@ -1148,10 +1284,11 @@ local function fireEvent(ev)
 	if not remote then
 		return false, "remote gone: " .. tostring(ev.path)
 	end
-	local n = ev.packed.n or 0
+	local packed = ev.packed or { n = 0 }
+	local n = packed.n or 0
 	local args = {}
 	for i = 1, n do
-		args[i] = cloneArg(ev.packed[i])
+		args[i] = cloneArg(packed[i])
 	end
 	if ev.method == "FireServer" then
 		local ok, err = pcall(function()
@@ -1178,7 +1315,7 @@ local function finishReplay(msg, color)
 	S.stopReplay = false
 	if startBtn then
 		startBtn.Text = "Start"
-		startBtn.BackgroundColor3 = THEME.OK
+		paintBtn(startBtn, THEME.OK)
 	end
 	if msg then
 		log(msg, color)
@@ -1208,10 +1345,16 @@ local function runReplay(take, steps, loops, loopGap, startAt)
 			end
 			local step = steps[s]
 			if step.kind == "wait" then
+				if markPlayLine then
+					markPlayLine(step.line)
+				end
 				pause(step.t or 0.03)
 			elseif step.inbound then
 				skipped = skipped + 1
 			else
+				if markPlayLine then
+					markPlayLine(step.line)
+				end
 				local ev = claimEvent(take, used, step.name, false)
 				if not ev then
 					failed = failed + 1
@@ -1297,7 +1440,7 @@ local function beginReplay(take, steps, startAt, why)
 	S.stopReplay = false
 	if startBtn then
 		startBtn.Text = "Stop"
-		startBtn.BackgroundColor3 = THEME.ERR
+		paintBtn(startBtn, THEME.ERR)
 	end
 	log(
 		string.format(
@@ -1432,6 +1575,9 @@ local function doFireOne()
 		}
 	end
 	local ok = fireEvent(ev)
+	if step.line then
+		markPlayLine(step.line)
+	end
 	if ok then
 		log("Fired 1: " .. tostring(step.name), THEME.OK)
 	else
@@ -1452,86 +1598,6 @@ local function doCopy()
 		log("Copied notepad to clipboard.", THEME.OK)
 	else
 		log("Clipboard blocked. Script printed in F9 console.", THEME.WARN)
-	end
-end
-
-local function buildLuaScript()
-	local take = S.saved
-	local steps = parseNote(getNoteText())
-	local lines = {
-		"-- ActionSpy Lua export  (paste into an executor)",
-		"-- Uses the args captured when you recorded. Inbound lines are comments.",
-		"local RS = game:GetService(\"ReplicatedStorage\")",
-		"local function findRemote(name, path)",
-		"	if type(path) == \"string\" and path ~= \"\" and path ~= name then",
-		"		local cur = game",
-		"		for part in string.gmatch(path, \"[^.]+\") do",
-		"			cur = cur:FindFirstChild(part)",
-		"			if not cur then break end",
-		"		end",
-		"		if cur then return cur end",
-		"	end",
-		"	for _, d in ipairs(RS:GetDescendants()) do",
-		"		if d.Name == name and (d:IsA(\"RemoteEvent\") or d:IsA(\"RemoteFunction\") or d:IsA(\"UnreliableRemoteEvent\")) then",
-		"			return d",
-		"		end",
-		"	end",
-		"end",
-		"local function out(name, path, method, ...)",
-		"	local r = findRemote(name, path)",
-		"	if not r then return end",
-		"	if method == \"InvokeServer\" then",
-		"		pcall(function() r:InvokeServer(...) end)",
-		"	else",
-		"		pcall(function() r:FireServer(...) end)",
-		"	end",
-		"end",
-		"",
-	}
-	-- fix the gmatch line - I accidentally put a space in the pattern
-	-- I'll write it properly in the actual file
-	local used = {}
-	for i = 1, #steps do
-		local step = steps[i]
-		if step.kind == "wait" then
-			lines[#lines + 1] = string.format("task.wait(%.2f)", step.t or 0)
-		elseif step.kind == "fire" and step.inbound then
-			lines[#lines + 1] = "-- in " .. tostring(step.name)
-		elseif step.kind == "fire" then
-			local ev = take and claimEvent(take, used, step.name, false)
-			local path = ev and ev.path or step.name
-			local method = "FireServer"
-			if (ev and ev.method == "InvokeServer") or step.invoke then
-				method = "InvokeServer"
-			end
-			local args = ev and luaArgs(ev.packed) or ""
-			local nameQ = string.format("%q", tostring(step.name))
-			local pathQ = string.format("%q", tostring(path))
-			if args ~= "" then
-				lines[#lines + 1] = string.format("out(%s, %s, %q, %s)", nameQ, pathQ, method, args)
-			else
-				lines[#lines + 1] = string.format("out(%s, %s, %q)", nameQ, pathQ, method)
-			end
-		end
-	end
-	return table.concat(lines, "\n")
-end
-
-local function doCopyLua()
-	if S.recording then
-		log("Stop recording first.", THEME.WARN)
-		return
-	end
-	local body = getNoteText()
-	if body == "" or string.find(body, "nothing recorded", 1, true) then
-		log("Nothing to export. Record first.", THEME.WARN)
-		return
-	end
-	local src = buildLuaScript()
-	if clipSet(src) then
-		log("Copied Lua (real FireServer + args) to clipboard.", THEME.OK)
-	else
-		log("Clipboard blocked. Lua printed in F9 console.", THEME.WARN)
 	end
 end
 
@@ -1566,18 +1632,7 @@ local function doDeleteAll()
 		log("Click a line first (Ctrl+click for more), then Delete all.", THEME.WARN)
 		return
 	end
-	local removed = 0
-	local keep = {}
-	local text = getNoteText() .. "\n"
-	for line in string.gmatch(text, "(.-)\n") do
-		local key = keyFromLine(line)
-		if key and S.selected[key] then
-			removed = removed + 1
-		else
-			keep[#keep + 1] = line
-		end
-	end
-	setNoteText(table.concat(squashWaits(keep), "\n"))
+	local types = selectedCount()
 	if S.saved and S.saved.events then
 		local evs = {}
 		for i = 1, #S.saved.events do
@@ -1589,10 +1644,11 @@ local function doDeleteAll()
 		end
 		S.saved.events = evs
 	end
-	local types = selectedCount()
+	setNoteText(scriptFromTake(S.saved))
 	S.selected = {}
 	refreshList()
-	log(string.format("Removed %d line(s) across %d type(s).", removed, types), THEME.OK)
+	local after = S.saved and S.saved.events and #S.saved.events or 0
+	log(string.format("Removed %d type(s). Notepad now matches the %d leftover recorded events.", types, after), THEME.OK)
 end
 
 local function doSetWaits()
@@ -1636,10 +1692,12 @@ local function doSetWaits()
 end
 
 local function mkBtn(parent, text, x, w, color, fn)
+	local base = color or THEME.BTN
 	local b = Instance.new("TextButton")
 	b.Size = UDim2.fromOffset(w, 32)
 	b.Position = UDim2.fromOffset(x, 0)
-	b.BackgroundColor3 = color or THEME.BTN
+	b.BackgroundColor3 = base
+	b._base = base
 	b.BorderSizePixel = 0
 	b.Font = Enum.Font.GothamMedium
 	b.TextSize = 13
@@ -1648,6 +1706,28 @@ local function mkBtn(parent, text, x, w, color, fn)
 	b.AutoButtonColor = false
 	b.Parent = parent
 	corner(b, 8)
+	b.MouseEnter:Connect(function()
+		local c = b._base or base
+		tween(b, {
+			BackgroundColor3 = Color3.new(
+				math.min(c.R + 0.07, 1),
+				math.min(c.G + 0.07, 1),
+				math.min(c.B + 0.07, 1)
+			),
+		}, 0.1)
+	end)
+	b.MouseLeave:Connect(function()
+		tween(b, { BackgroundColor3 = b._base or base }, 0.12)
+	end)
+	b.MouseButton1Down:Connect(function()
+		local c = b._base or base
+		tween(b, {
+			BackgroundColor3 = Color3.new(c.R * 0.82, c.G * 0.82, c.B * 0.82),
+		}, 0.06)
+	end)
+	b.MouseButton1Up:Connect(function()
+		tween(b, { BackgroundColor3 = b._base or base }, 0.1)
+	end)
 	b.MouseButton1Click:Connect(fn)
 	return b
 end
@@ -1712,30 +1792,63 @@ local function createGui()
 	parentGui(gui)
 
 	win = Instance.new("Frame")
-	win.Size = UDim2.fromOffset(760, 400)
+	win.Size = UDim2.fromOffset(780, 420)
 	win.Position = UDim2.fromOffset(64, 64)
 	win.BackgroundColor3 = THEME.BG
 	win.BorderSizePixel = 0
+	win.ClipsDescendants = true
+	win.Active = true
 	win.Parent = gui
-	corner(win, 10)
+	corner(win, 12)
+	stroke(win, THEME.STROKE, 1)
+	local uiScale = Instance.new("UIScale")
+	uiScale.Scale = 0.96
+	uiScale.Parent = win
+	tween(uiScale, { Scale = 1 }, 0.22)
 
 	local top = Instance.new("Frame")
-	top.Size = UDim2.new(1, 0, 0, 40)
+	top.Size = UDim2.new(1, 0, 0, 42)
 	top.BackgroundColor3 = THEME.PANEL
 	top.BorderSizePixel = 0
 	top.Parent = win
-	corner(top, 10)
+	corner(top, 12)
+	stroke(top, THEME.STROKE, 1)
 
 	local title = Instance.new("TextLabel")
 	title.BackgroundTransparency = 1
-	title.Position = UDim2.fromOffset(12, 0)
-	title.Size = UDim2.new(1, -52, 1, 0)
+	title.Position = UDim2.fromOffset(14, 0)
+	title.Size = UDim2.new(1, -96, 1, 0)
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 14
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.TextColor3 = THEME.TEXT
 	title.Text = "Action Spy"
 	title.Parent = top
+	title.Active = true
+
+	statusLab = Instance.new("TextLabel")
+	statusLab.BackgroundTransparency = 1
+	statusLab.Position = UDim2.new(1, -210, 0, 0)
+	statusLab.Size = UDim2.fromOffset(110, 42)
+	statusLab.Font = Enum.Font.Gotham
+	statusLab.TextSize = 11
+	statusLab.TextXAlignment = Enum.TextXAlignment.Right
+	statusLab.TextColor3 = THEME.DIM
+	statusLab.Text = "idle"
+	statusLab.Parent = top
+
+	local minBtn = Instance.new("TextButton")
+	minBtn.Size = UDim2.fromOffset(28, 24)
+	minBtn.Position = UDim2.new(1, -68, 0.5, -12)
+	minBtn.BackgroundColor3 = THEME.BTN
+	minBtn.BorderSizePixel = 0
+	minBtn.Text = "–"
+	minBtn.Font = Enum.Font.GothamBold
+	minBtn.TextSize = 16
+	minBtn.TextColor3 = THEME.TEXT
+	minBtn.AutoButtonColor = false
+	minBtn.Parent = top
+	corner(minBtn, 6)
 
 	local close = Instance.new("TextButton")
 	close.Size = UDim2.fromOffset(28, 24)
@@ -1746,14 +1859,35 @@ local function createGui()
 	close.Font = Enum.Font.GothamBold
 	close.TextSize = 12
 	close.TextColor3 = THEME.TEXT
+	close.AutoButtonColor = false
 	close.Parent = top
 	corner(close, 6)
+	close.MouseEnter:Connect(function()
+		tween(close, { BackgroundColor3 = THEME.ERR }, 0.1)
+	end)
+	close.MouseLeave:Connect(function()
+		tween(close, { BackgroundColor3 = THEME.BTN }, 0.12)
+	end)
 	close.MouseButton1Click:Connect(destroyGui)
 
-	dragBegan = top.InputBegan:Connect(function(input)
+	local savedH = 420
+	minBtn.MouseButton1Click:Connect(function()
+		S.minimized = not S.minimized
+		if S.minimized then
+			savedH = win.AbsoluteSize.Y
+			tween(win, { Size = UDim2.fromOffset(win.AbsoluteSize.X, 42) }, 0.18)
+			minBtn.Text = "+"
+		else
+			tween(win, { Size = UDim2.fromOffset(win.AbsoluteSize.X, savedH) }, 0.18)
+			minBtn.Text = "–"
+		end
+	end)
+
+	dragBegan = title.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			dragging = true
 			resizing = false
+			splitting = false
 			dragStart = input.Position
 			startPos = win.Position
 		end
@@ -1762,6 +1896,7 @@ local function createGui()
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			dragging = false
 			resizing = false
+			splitting = false
 		end
 	end)
 	dragConn = UIS.InputChanged:Connect(function(input)
@@ -1771,21 +1906,39 @@ local function createGui()
 		if dragging then
 			local d = input.Position - dragStart
 			win.Position = UDim2.fromOffset(startPos.X.Offset + d.X, startPos.Y.Offset + d.Y)
-		elseif resizing then
+		elseif splitting then
+			if S.minimized then
+				return
+			end
+			local d = input.Position - splitStart
+			local w = splitW + d.X
+			if w < 170 then
+				w = 170
+			elseif w > 420 then
+				w = 420
+			end
+			S.listW = w
+			if layoutPanels then
+				layoutPanels()
+			end
+		elseif resizing and not S.minimized then
 			local d = input.Position - resizeStart
 			local w = startSize.X + d.X
 			local h = startSize.Y + d.Y
-			if w < 560 then
-				w = 560
-			elseif w > 1400 then
-				w = 1400
+			if w < 580 then
+				w = 580
+			elseif w > 1500 then
+				w = 1500
 			end
-			if h < 280 then
-				h = 280
-			elseif h > 900 then
-				h = 900
+			if h < 300 then
+				h = 300
+			elseif h > 920 then
+				h = 920
 			end
 			win.Size = UDim2.fromOffset(w, h)
+			if layoutPanels then
+				layoutPanels()
+			end
 		end
 	end)
 
@@ -1883,19 +2036,36 @@ local function createGui()
 	mkBtn(bar2, "Set waits", 184, 80, THEME.BTN, doSetWaits)
 	mkBtn(bar2, "From here", 272, 84, THEME.OK, doFromHere)
 	mkBtn(bar2, "Fire 1", 364, 64, THEME.BTN, doFireOne)
-	mkBtn(bar2, "Lua", 436, 52, THEME.OK, doCopyLua)
 
-	local listHold = Instance.new("Frame")
-	listHold.Position = UDim2.fromOffset(12, 128)
-	listHold.Size = UDim2.new(0, 280, 1, -180)
+	listHold = Instance.new("Frame")
 	listHold.BackgroundColor3 = THEME.PANEL
 	listHold.BorderSizePixel = 0
 	listHold.Parent = win
 	corner(listHold, 8)
+	stroke(listHold, THEME.STROKE, 1)
+
+	filterBox = Instance.new("TextBox")
+	filterBox.Position = UDim2.fromOffset(8, 6)
+	filterBox.Size = UDim2.new(1, -16, 0, 24)
+	filterBox.BackgroundColor3 = THEME.BG
+	filterBox.BorderSizePixel = 0
+	filterBox.Font = Enum.Font.Gotham
+	filterBox.TextSize = 12
+	filterBox.TextColor3 = THEME.TEXT
+	filterBox.PlaceholderColor3 = THEME.DIM
+	filterBox.PlaceholderText = "filter remotes…"
+	filterBox.Text = ""
+	filterBox.ClearTextOnFocus = false
+	filterBox.Parent = listHold
+	corner(filterBox, 6)
+	filterBox:GetPropertyChangedSignal("Text"):Connect(function()
+		S.listFilter = string.lower(filterBox.Text or "")
+		refreshList()
+	end)
 
 	listFrame = Instance.new("ScrollingFrame")
-	listFrame.Position = UDim2.fromOffset(4, 4)
-	listFrame.Size = UDim2.new(1, -8, 1, -8)
+	listFrame.Position = UDim2.fromOffset(4, 34)
+	listFrame.Size = UDim2.new(1, -8, 1, -38)
 	listFrame.BackgroundTransparency = 1
 	listFrame.BorderSizePixel = 0
 	listFrame.ScrollBarThickness = 4
@@ -1906,13 +2076,50 @@ local function createGui()
 	lay.Padding = UDim.new(0, 1)
 	lay.Parent = listFrame
 
-	local noteHold = Instance.new("Frame")
-	noteHold.Position = UDim2.fromOffset(300, 128)
-	noteHold.Size = UDim2.new(1, -312, 1, -180)
+	splitBar = Instance.new("TextButton")
+	splitBar.AutoButtonColor = false
+	splitBar.Text = ""
+	splitBar.BackgroundColor3 = THEME.STROKE
+	splitBar.BackgroundTransparency = 0.35
+	splitBar.BorderSizePixel = 0
+	splitBar.ZIndex = 4
+	splitBar.Parent = win
+	corner(splitBar, 3)
+	splitBar.MouseEnter:Connect(function()
+		tween(splitBar, { BackgroundTransparency = 0 }, 0.1)
+	end)
+	splitBar.MouseLeave:Connect(function()
+		if not splitting then
+			tween(splitBar, { BackgroundTransparency = 0.35 }, 0.12)
+		end
+	end)
+	splitBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			splitting = true
+			dragging = false
+			resizing = false
+			splitStart = input.Position
+			splitW = S.listW or 280
+		end
+	end)
+
+	noteHold = Instance.new("Frame")
 	noteHold.BackgroundColor3 = THEME.PANEL
 	noteHold.BorderSizePixel = 0
 	noteHold.Parent = win
 	corner(noteHold, 8)
+	stroke(noteHold, THEME.STROKE, 1)
+
+	layoutPanels = function()
+		local lw = S.listW or 280
+		listHold.Position = UDim2.fromOffset(12, 128)
+		listHold.Size = UDim2.new(0, lw, 1, -180)
+		splitBar.Position = UDim2.fromOffset(12 + lw + 1, 140)
+		splitBar.Size = UDim2.new(0, 6, 1, -204)
+		noteHold.Position = UDim2.fromOffset(12 + lw + 10, 128)
+		noteHold.Size = UDim2.new(1, -(12 + lw + 10 + 12), 1, -180)
+	end
+	layoutPanels()
 
 	noteScroll = Instance.new("ScrollingFrame")
 	noteScroll.Position = UDim2.fromOffset(4, 4)
@@ -1926,6 +2133,29 @@ local function createGui()
 	noteScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 	noteScroll.ClipsDescendants = true
 	noteScroll.Parent = noteHold
+
+	local function beamOn()
+		pcall(function()
+			UIS.MouseIcon = "rbxasset://SystemCursors/IBeam"
+		end)
+		pcall(function()
+			if lp then
+				lp:GetMouse().Icon = "rbxasset://SystemCursors/IBeam"
+			end
+		end)
+	end
+	local function beamOff()
+		pcall(function()
+			UIS.MouseIcon = ""
+		end)
+		pcall(function()
+			if lp then
+				lp:GetMouse().Icon = ""
+			end
+		end)
+	end
+	noteHold.MouseEnter:Connect(beamOn)
+	noteHold.MouseLeave:Connect(beamOff)
 
 	local noteList = Instance.new("Frame")
 	noteList.BackgroundTransparency = 1
@@ -1968,6 +2198,14 @@ local function createGui()
 			end
 		end
 		noteBox = nil
+		noteRowFrames = {}
+		local function paintEdit()
+			for _, ch in ipairs(noteList:GetChildren()) do
+				if ch:IsA("Frame") then
+					ch.BackgroundTransparency = ch.LayoutOrder == S.editIndex and 0.45 or 1
+				end
+			end
+		end
 		for i = 1, #noteData do
 			local idx = i
 			local row = Instance.new("Frame")
@@ -1975,89 +2213,79 @@ local function createGui()
 			row.BackgroundColor3 = THEME.LINE
 			row.BackgroundTransparency = idx == S.editIndex and 0.45 or 1
 			row.BorderSizePixel = 0
+			row.Active = false
 			row.LayoutOrder = idx
 			row.Parent = noteList
+			noteRowFrames[idx] = row
+			local box = Instance.new("TextBox")
+			box.Size = UDim2.new(1, -4, 1, 0)
+			box.Position = UDim2.fromOffset(2, 0)
+			box.BackgroundTransparency = 1
+			box.BorderSizePixel = 0
+			box.ClearTextOnFocus = false
+			box.TextWrapped = false
+			box.TextXAlignment = Enum.TextXAlignment.Left
+			box.TextYAlignment = Enum.TextYAlignment.Center
+			box.Font = Enum.Font.Code
+			box.TextSize = 13
+			box.TextColor3 = lineColor(noteData[idx])
+			box.Text = noteData[idx]
+			box.Parent = row
+			box.MouseEnter:Connect(beamOn)
 			if idx == S.editIndex then
-				local box = Instance.new("TextBox")
-				box.Size = UDim2.new(1, -8, 1, 0)
-				box.Position = UDim2.fromOffset(4, 0)
-				box.BackgroundTransparency = 1
-				box.BorderSizePixel = 0
-				box.ClearTextOnFocus = false
-				box.TextWrapped = false
-				box.TextXAlignment = Enum.TextXAlignment.Left
-				box.TextYAlignment = Enum.TextYAlignment.Center
-				box.Font = Enum.Font.Code
-				box.TextSize = 13
-				box.TextColor3 = lineColor(noteData[idx])
-				box.Text = noteData[idx]
-				box.Parent = row
 				noteBox = box
 				editSlot = idx
-				box:GetPropertyChangedSignal("Text"):Connect(function()
-					noteData[idx] = box.Text
-					box.TextColor3 = lineColor(box.Text)
-					previewArgs()
-				end)
-				box.FocusLost:Connect(function(enter)
-					noteData[idx] = box.Text
-					if enter then
-						table.insert(noteData, idx + 1, "")
-						S.editIndex = idx + 1
-						rebuildNote(true)
-					else
-						previewArgs()
-					end
-				end)
-				box.InputBegan:Connect(function(input)
-					if input.UserInputType ~= Enum.UserInputType.Keyboard then
-						return
-					end
-					if input.KeyCode == Enum.KeyCode.Up then
-						noteData[idx] = box.Text
-						if S.editIndex > 1 then
-							S.editIndex = S.editIndex - 1
-							rebuildNote(true)
-						end
-					elseif input.KeyCode == Enum.KeyCode.Down then
-						noteData[idx] = box.Text
-						if S.editIndex < #noteData then
-							S.editIndex = S.editIndex + 1
-							rebuildNote(true)
-						end
-					elseif input.KeyCode == Enum.KeyCode.Backspace then
-						if box.Text == "" and #noteData > 1 then
-							table.remove(noteData, idx)
-							if S.editIndex > #noteData then
-								S.editIndex = #noteData
-							elseif idx > 1 then
-								S.editIndex = idx - 1
-							end
-							rebuildNote(true)
-						end
-					end
-				end)
-			else
-				local btn = Instance.new("TextButton")
-				btn.Size = UDim2.new(1, -8, 1, 0)
-				btn.Position = UDim2.fromOffset(4, 0)
-				btn.BackgroundTransparency = 1
-				btn.BorderSizePixel = 0
-				btn.AutoButtonColor = false
-				btn.TextWrapped = false
-				btn.TextXAlignment = Enum.TextXAlignment.Left
-				btn.TextYAlignment = Enum.TextYAlignment.Center
-				btn.Font = Enum.Font.Code
-				btn.TextSize = 13
-				btn.TextColor3 = lineColor(noteData[idx])
-				btn.Text = noteData[idx]
-				btn.Parent = row
-				btn.MouseButton1Click:Connect(function()
-					commitEdit()
-					S.editIndex = idx
-					rebuildNote(true)
-				end)
 			end
+			box.Focused:Connect(function()
+				S.editIndex = idx
+				editSlot = idx
+				noteBox = box
+				paintEdit()
+				previewArgs()
+			end)
+			box:GetPropertyChangedSignal("Text"):Connect(function()
+				noteData[idx] = box.Text
+				box.TextColor3 = lineColor(box.Text)
+				previewArgs()
+			end)
+			box.FocusLost:Connect(function(enter)
+				noteData[idx] = box.Text
+				if enter then
+					table.insert(noteData, idx + 1, "")
+					S.editIndex = idx + 1
+					rebuildNote(true)
+				else
+					previewArgs()
+				end
+			end)
+			box.InputBegan:Connect(function(input)
+				if input.UserInputType ~= Enum.UserInputType.Keyboard then
+					return
+				end
+				if input.KeyCode == Enum.KeyCode.Up then
+					noteData[idx] = box.Text
+					if S.editIndex > 1 then
+						S.editIndex = S.editIndex - 1
+						rebuildNote(true)
+					end
+				elseif input.KeyCode == Enum.KeyCode.Down then
+					noteData[idx] = box.Text
+					if S.editIndex < #noteData then
+						S.editIndex = S.editIndex + 1
+						rebuildNote(true)
+					end
+				elseif input.KeyCode == Enum.KeyCode.Backspace then
+					if box.Text == "" and #noteData > 1 then
+						table.remove(noteData, idx)
+						if S.editIndex > #noteData then
+							S.editIndex = #noteData
+						elseif idx > 1 then
+							S.editIndex = idx - 1
+						end
+						rebuildNote(true)
+					end
+				end
+			end)
 		end
 		previewArgs()
 		if grab and noteBox then
@@ -2089,26 +2317,57 @@ local function createGui()
 	logLabel.TextXAlignment = Enum.TextXAlignment.Left
 	logLabel.TextColor3 = THEME.DIM
 	logLabel.TextWrapped = true
-	logLabel.Text = "  Click a notepad line to edit. Lua copies a real FireServer script with the recorded args."
+	logLabel.Text = "  Drag the title to move. Drag the bar between panels, or the corner, to resize. F10 closes."
 	logLabel.Parent = win
 	corner(logLabel, 6)
+	stroke(logLabel, THEME.STROKE, 1)
 
 	local grip = Instance.new("TextButton")
 	grip.AutoButtonColor = false
 	grip.Text = ""
-	grip.Size = UDim2.fromOffset(16, 16)
-	grip.Position = UDim2.new(1, -16, 1, -16)
-	grip.BackgroundColor3 = THEME.BTN
+	grip.Size = UDim2.fromOffset(18, 18)
+	grip.Position = UDim2.new(1, -20, 1, -20)
+	grip.BackgroundColor3 = THEME.HOVER
 	grip.BorderSizePixel = 0
-	grip.ZIndex = 5
+	grip.ZIndex = 8
 	grip.Parent = win
-	corner(grip, 4)
+	corner(grip, 5)
+	for i = 1, 3 do
+		local d = Instance.new("Frame")
+		d.BackgroundColor3 = THEME.DIM
+		d.BorderSizePixel = 0
+		d.Size = UDim2.fromOffset(8, 2)
+		d.Position = UDim2.fromOffset(5, 3 + i * 3)
+		d.Rotation = -45
+		d.ZIndex = 9
+		d.Parent = grip
+	end
+	grip.MouseEnter:Connect(function()
+		tween(grip, { BackgroundColor3 = THEME.OK }, 0.1)
+	end)
+	grip.MouseLeave:Connect(function()
+		tween(grip, { BackgroundColor3 = THEME.HOVER }, 0.12)
+	end)
 	grip.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and not S.minimized then
 			resizing = true
 			dragging = false
+			splitting = false
 			resizeStart = input.Position
 			startSize = win.AbsoluteSize
+		end
+	end)
+
+	later(function()
+		while win and win.Parent and not S.stopped do
+			if S.recording and recBtn and recBtn.Parent then
+				tween(recBtn, { BackgroundColor3 = Color3.fromRGB(255, 96, 96) }, 0.35)
+				pause(0.35)
+				if S.recording and recBtn and recBtn.Parent then
+					tween(recBtn, { BackgroundColor3 = THEME.ERR }, 0.35)
+				end
+			end
+			pause(0.08)
 		end
 	end)
 end
