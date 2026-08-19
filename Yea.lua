@@ -71,6 +71,7 @@ local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
 local resizing, resizeStart, startSize, splitting, splitStart, splitW
 local rebuildNote, layoutPanels, markPlayLine
+local btnBase = {}
 
 local function envGet(name)
 	if type(getgenv) == "function" then
@@ -183,7 +184,7 @@ local function paintBtn(b, color)
 	if not b then
 		return
 	end
-	b._base = color
+	btnBase[b] = color
 	tween(b, { BackgroundColor3 = color }, 0.12)
 end
 
@@ -1697,7 +1698,7 @@ local function mkBtn(parent, text, x, w, color, fn)
 	b.Size = UDim2.fromOffset(w, 32)
 	b.Position = UDim2.fromOffset(x, 0)
 	b.BackgroundColor3 = base
-	b._base = base
+	btnBase[b] = base
 	b.BorderSizePixel = 0
 	b.Font = Enum.Font.GothamMedium
 	b.TextSize = 13
@@ -1707,7 +1708,7 @@ local function mkBtn(parent, text, x, w, color, fn)
 	b.Parent = parent
 	corner(b, 8)
 	b.MouseEnter:Connect(function()
-		local c = b._base or base
+		local c = btnBase[b] or base
 		tween(b, {
 			BackgroundColor3 = Color3.new(
 				math.min(c.R + 0.07, 1),
@@ -1717,16 +1718,16 @@ local function mkBtn(parent, text, x, w, color, fn)
 		}, 0.1)
 	end)
 	b.MouseLeave:Connect(function()
-		tween(b, { BackgroundColor3 = b._base or base }, 0.12)
+		tween(b, { BackgroundColor3 = btnBase[b] or base }, 0.12)
 	end)
 	b.MouseButton1Down:Connect(function()
-		local c = b._base or base
+		local c = btnBase[b] or base
 		tween(b, {
 			BackgroundColor3 = Color3.new(c.R * 0.82, c.G * 0.82, c.B * 0.82),
 		}, 0.06)
 	end)
 	b.MouseButton1Up:Connect(function()
-		tween(b, { BackgroundColor3 = b._base or base }, 0.1)
+		tween(b, { BackgroundColor3 = btnBase[b] or base }, 0.1)
 	end)
 	b.MouseButton1Click:Connect(fn)
 	return b
