@@ -46,6 +46,7 @@ local S = {
 local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, repeatBox, gapBox
 local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
+local resizing, resizeStart, startSize
 
 local function envGet(name)
 	if type(getgenv) == "function" then
@@ -241,25 +242,17 @@ local function scriptFromTake(take)
 	for i = 1, #take.events do
 		local ev = take.events[i]
 		local gap = (ev.delay or 0) - lastDelay
-		if i > 1 then
-			if gap >= 0.05 then
-				lines[#lines + 1] = ""
-				lines[#lines + 1] = string.format("wait(%.2f)", gap)
-				lines[#lines + 1] = ""
-			else
-				lines[#lines + 1] = ""
-			end
+		if i > 1 and gap >= 0.05 then
+			lines[#lines + 1] = string.format("wait(%.2f)", gap)
 		end
 		lastDelay = ev.delay or lastDelay
 		local name = tostring(ev.name or "Remote")
 		local ident = string.match(name, "^[%a_][%w_]*$")
 		local shown = ident and name or string.format("%q", name)
 		if ev.inbound then
-			lines[#lines + 1] = "in  fire(" .. shown .. "):  -- inbound  (game → you, Start skips this)"
-		elseif ev.method == "InvokeServer" then
-			lines[#lines + 1] = "out fire(" .. shown .. "):  -- outbound invoke"
+			lines[#lines + 1] = "in fire(" .. shown .. ")"
 		else
-			lines[#lines + 1] = "out fire(" .. shown .. "):  -- outbound"
+			lines[#lines + 1] = "out fire(" .. shown .. ")"
 		end
 	end
 	return table.concat(lines, "\n")
@@ -997,19 +990,39 @@ local function createGui()
 	dragBegan = top.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			dragging = true
+			resizing = false
 			dragStart = input.Position
 			startPos = win.Position
 		end
 	end)
-	dragEnded = top.InputEnded:Connect(function(input)
+	dragEnded = UIS.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			dragging = false
+			resizing = false
 		end
 	end)
 	dragConn = UIS.InputChanged:Connect(function(input)
-		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+		if dragging then
 			local d = input.Position - dragStart
 			win.Position = UDim2.fromOffset(startPos.X.Offset + d.X, startPos.Y.Offset + d.Y)
+		elseif resizing then
+			local d = input.Position - resizeStart
+			local w = startSize.X + d.X
+			local h = startSize.Y + d.Y
+			if w < 520 then
+				w = 520
+			elseif w > 1400 then
+				w = 1400
+			end
+			if h < 280 then
+				h = 280
+			elseif h > 900 then
+				h = 900
+			end
+			win.Size = UDim2.fromOffset(w, h)
 		end
 	end)
 
@@ -1101,9 +1114,22 @@ local function createGui()
 	noteHold.Parent = win
 	corner(noteHold, 8)
 
+	local noteScroll = Instance.new("ScrollingFrame")
+	noteScroll.Position = UDim2.fromOffset(4, 4)
+	noteScroll.Size = UDim2.new(1, -8, 1, -8)
+	noteScroll.BackgroundTransparency = 1
+	noteScroll.BorderSizePixel = 0
+	noteScroll.ScrollBarThickness = 6
+	noteScroll.ScrollBarImageColor3 = THEME.DIM
+	noteScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+	noteScroll.AutomaticCanvasSize = Enum.AutomaticSize.None
+	noteScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	noteScroll.ClipsDescendants = true
+	noteScroll.Parent = noteHold
+
 	noteBox = Instance.new("TextBox")
-	noteBox.Position = UDim2.fromOffset(8, 8)
-	noteBox.Size = UDim2.new(1, -16, 1, -16)
+	noteBox.Position = UDim2.fromOffset(4, 4)
+	noteBox.Size = UDim2.new(1, -14, 1, 0)
 	noteBox.BackgroundTransparency = 1
 	noteBox.BorderSizePixel = 0
 	noteBox.ClearTextOnFocus = false
@@ -1115,13 +1141,33 @@ local function createGui()
 	noteBox.TextSize = 13
 	noteBox.TextColor3 = THEME.TEXT
 	noteBox.PlaceholderColor3 = THEME.DIM
-	noteBox.PlaceholderText = "out fire(Remote):  -- outbound\n\nwait(0.50)\n\nin  fire(Other):  -- inbound"
-	noteBox.Text = "-- record, then stop.\n-- Start runs this notepad.\n-- Delete a line to skip it. Change wait(). Prefix -- to comment out."
-	noteBox.Parent = noteHold
+	noteBox.PlaceholderText = "out fire(Remote)\nwait(0.50)\nin fire(Other)"
+	noteBox.Text = "-- record, then stop.\n-- Start runs this notepad.\n-- out = you → server, in = game → you (Start skips in).\n-- Delete a line to skip it. Change wait()."
+	noteBox.Parent = noteScroll
+
+	local function fitNote()
+		if not noteBox or not noteBox.Parent or not noteScroll.Parent then
+			return
+		end
+		local viewH = noteScroll.AbsoluteWindowSize.Y
+		if viewH < 1 then
+			viewH = noteScroll.AbsoluteSize.Y
+		end
+		local th = noteBox.TextBounds.Y + 24
+		if th < viewH then
+			th = viewH
+		end
+		noteBox.Size = UDim2.new(1, -14, 0, th)
+		noteScroll.CanvasSize = UDim2.new(0, 0, 0, th)
+	end
+	noteBox:GetPropertyChangedSignal("Text"):Connect(fitNote)
+	noteBox:GetPropertyChangedSignal("TextBounds"):Connect(fitNote)
+	noteScroll:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitNote)
+	task.defer(fitNote)
 
 	logLabel = Instance.new("TextLabel")
 	logLabel.Position = UDim2.new(0, 12, 1, -40)
-	logLabel.Size = UDim2.new(1, -24, 0, 28)
+	logLabel.Size = UDim2.new(1, -40, 0, 28)
 	logLabel.BackgroundColor3 = THEME.PANEL
 	logLabel.BorderSizePixel = 0
 	logLabel.Font = Enum.Font.Gotham
@@ -1129,9 +1175,28 @@ local function createGui()
 	logLabel.TextXAlignment = Enum.TextXAlignment.Left
 	logLabel.TextColor3 = THEME.DIM
 	logLabel.TextWrapped = true
-	logLabel.Text = "  Record → stop. Edit notepad (out/in, wait, delete lines). Start runs the notepad. F10 closes."
+	logLabel.Text = "  Record → stop. Edit notepad (out/in, wait). Start runs it. Drag corner to resize. F10 closes."
 	logLabel.Parent = win
 	corner(logLabel, 6)
+
+	local grip = Instance.new("TextButton")
+	grip.AutoButtonColor = false
+	grip.Text = ""
+	grip.Size = UDim2.fromOffset(16, 16)
+	grip.Position = UDim2.new(1, -16, 1, -16)
+	grip.BackgroundColor3 = THEME.BTN
+	grip.BorderSizePixel = 0
+	grip.ZIndex = 5
+	grip.Parent = win
+	corner(grip, 4)
+	grip.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			resizing = true
+			dragging = false
+			resizeStart = input.Position
+			startSize = win.AbsoluteSize
+		end
+	end)
 end
 
 local function boot()
