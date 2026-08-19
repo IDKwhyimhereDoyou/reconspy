@@ -20,6 +20,7 @@ local THEME = {
 	OK = Color3.fromRGB(72, 196, 128),
 	OUT = Color3.fromRGB(72, 196, 128),
 	IN = Color3.fromRGB(160, 140, 255),
+	SEL = Color3.fromRGB(56, 56, 88),
 }
 
 local NOISY = {
@@ -45,9 +46,11 @@ local S = {
 	listDirty = false,
 	lastPaint = 0,
 	stopReplay = false,
+	selected = {},
+	backup = nil,
 }
 
-local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, noteOverlay, repeatBox, gapBox
+local gui, win, logLabel, recBtn, startBtn, listFrame, noteBox, noteOverlay, repeatBox, gapBox, waitAllBox
 local f10Conn, dragConn, dragBegan, dragEnded
 local dragging, dragStart, startPos
 local resizing, resizeStart, startSize
@@ -410,6 +413,63 @@ local function namesEqual(a, b)
 	return string.lower(tostring(a or "")) == string.lower(tostring(b or ""))
 end
 
+local function typeKey(inbound, name)
+	return (inbound and "in|" or "out|") .. string.lower(tostring(name or ""))
+end
+
+local function ctrlHeld()
+	local ok, v = pcall(function()
+		return UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)
+	end)
+	return ok and v == true
+end
+
+local function keyFromLine(t)
+	t = string.match(tostring(t or ""), "^%s*(.-)%s*$") or ""
+	if t == "" or string.match(t, "^%-%-") then
+		return nil
+	end
+	local inner = string.match(t, "[Ff][Ii][Rr][Ee]%s*%(%s*(.-)%s*%)")
+	if not inner then
+		return nil
+	end
+	local name = parseNameToken(inner)
+	local low = string.lower(t)
+	local inbound = false
+	if string.match(low, "^in[%s%p]") or string.match(low, "^in$") then
+		inbound = true
+	end
+	if string.match(low, "^out[%s%p]") then
+		inbound = false
+	end
+	if string.find(low, "%-%-%s*inbound", 1, false) then
+		inbound = true
+	end
+	if string.find(low, "%-%-%s*outbound", 1, false) then
+		inbound = false
+	end
+	return typeKey(inbound, name)
+end
+
+local function copyTake(take)
+	if not take then
+		return nil
+	end
+	local evs = {}
+	for i = 1, #(take.events or {}) do
+		evs[i] = take.events[i]
+	end
+	return { events = evs }
+end
+
+local function selectedCount()
+	local n = 0
+	for _ in pairs(S.selected or {}) do
+		n = n + 1
+	end
+	return n
+end
+
 local function claimEvent(take, used, name, inbound)
 	if not take then
 		return nil
@@ -433,7 +493,7 @@ local function refreshList()
 		return
 	end
 	for _, ch in ipairs(listFrame:GetChildren()) do
-		if ch:IsA("TextLabel") then
+		if not ch:IsA("UIListLayout") then
 			ch:Destroy()
 		end
 	end
@@ -453,15 +513,35 @@ local function refreshList()
 	local maxShow = math.min(#take.events, 80)
 	for i = 1, maxShow do
 		local ev = take.events[i]
-		local row = Instance.new("TextLabel")
+		local key = typeKey(ev.inbound, ev.name)
+		local on = S.selected[key] == true
+		local row = Instance.new("TextButton")
 		row.Size = UDim2.new(1, -4, 0, 18)
-		row.BackgroundTransparency = 1
+		row.BackgroundColor3 = THEME.SEL
+		row.BackgroundTransparency = on and 0.25 or 1
+		row.BorderSizePixel = 0
+		row.AutoButtonColor = false
 		row.Font = Enum.Font.Gotham
 		row.TextSize = 12
 		row.TextXAlignment = Enum.TextXAlignment.Left
 		row.TextColor3 = ev.inbound and THEME.IN or THEME.OUT
 		row.Text = "  " .. trunc(ev.label, 70)
 		row.Parent = listFrame
+		row.MouseButton1Click:Connect(function()
+			if S.recording or S.replaying then
+				return
+			end
+			if ctrlHeld() then
+				if S.selected[key] then
+					S.selected[key] = nil
+				else
+					S.selected[key] = true
+				end
+			else
+				S.selected = { [key] = true }
+			end
+			refreshList()
+		end)
 	end
 	if #take.events > maxShow then
 		local more = Instance.new("TextLabel")
@@ -711,6 +791,7 @@ local function startRecord()
 	S.recording = true
 	S.t0 = 0
 	S.live = { events = {}, spam = {}, hits = {} }
+	S.selected = {}
 	S.lastPaint = 0
 	if recBtn then
 		recBtn.Text = "Stop"
@@ -729,6 +810,8 @@ local function stopRecord()
 	stopInbound()
 	S.saved = S.live
 	S.live = nil
+	S.selected = {}
+	S.backup = copyTake(S.saved)
 	if recBtn then
 		recBtn.Text = "Record"
 		recBtn.BackgroundColor3 = THEME.BTN
@@ -963,9 +1046,96 @@ local function doReset()
 		return
 	end
 	if noteBox then
-		noteBox.Text = S.originalNote or scriptFromTake(S.saved)
+		noteBox.Text = S.originalNote or scriptFromTake(S.backup or S.saved)
 	end
+	if S.backup then
+		S.saved = copyTake(S.backup)
+	end
+	S.selected = {}
+	refreshList()
 	log("Notepad restored to the recording.", THEME.OK)
+end
+
+local function doDeleteAll()
+	if S.recording then
+		log("Stop recording first.", THEME.WARN)
+		return
+	end
+	if S.replaying then
+		log("Wait until Start finishes.", THEME.WARN)
+		return
+	end
+	if selectedCount() == 0 then
+		log("Click a line first (Ctrl+click for more), then Delete all.", THEME.WARN)
+		return
+	end
+	local removed = 0
+	if noteBox then
+		local keep = {}
+		local text = tostring(noteBox.Text or "") .. "\n"
+		for line in string.gmatch(text, "(.-)\n") do
+			local key = keyFromLine(line)
+			if key and S.selected[key] then
+				removed = removed + 1
+			else
+				keep[#keep + 1] = line
+			end
+		end
+		noteBox.Text = table.concat(keep, "\n")
+	end
+	if S.saved and S.saved.events then
+		local evs = {}
+		for i = 1, #S.saved.events do
+			local ev = S.saved.events[i]
+			local key = typeKey(ev.inbound, ev.name)
+			if not S.selected[key] then
+				evs[#evs + 1] = ev
+			end
+		end
+		S.saved.events = evs
+	end
+	local types = selectedCount()
+	S.selected = {}
+	refreshList()
+	log(string.format("Removed %d line(s) across %d type(s).", removed, types), THEME.OK)
+end
+
+local function doSetWaits()
+	if S.recording then
+		log("Stop recording first.", THEME.WARN)
+		return
+	end
+	if S.replaying then
+		log("Wait until Start finishes.", THEME.WARN)
+		return
+	end
+	if not noteBox then
+		return
+	end
+	local sec = tonumber(waitAllBox and waitAllBox.Text or "")
+	if not sec then
+		log("Type a wait time first, e.g. 0.10", THEME.WARN)
+		return
+	end
+	if sec < 0 then
+		sec = 0
+	elseif sec > 8 then
+		sec = 8
+	end
+	local n = 0
+	local keep = {}
+	local text = tostring(noteBox.Text or "") .. "\n"
+	for line in string.gmatch(text, "(.-)\n") do
+		local t = string.match(line, "^%s*(.-)%s*$") or ""
+		if t ~= "" and not string.match(t, "^%-%-") and string.match(t, "^wait%s*%(") then
+			keep[#keep + 1] = string.format("wait(%.2f)", sec)
+			n = n + 1
+		else
+			keep[#keep + 1] = line
+		end
+	end
+	noteBox.Text = table.concat(keep, "\n")
+	log(string.format("Set %d wait() to %.2f.", n, sec), THEME.OK)
 end
 
 local function mkBtn(parent, text, x, w, color, fn)
@@ -1181,9 +1351,54 @@ local function createGui()
 	gapBox.Parent = bar
 	corner(gapBox, 8)
 
+	local bar2 = Instance.new("Frame")
+	bar2.BackgroundTransparency = 1
+	bar2.Position = UDim2.fromOffset(12, 88)
+	bar2.Size = UDim2.new(1, -24, 0, 32)
+	bar2.Parent = win
+
+	mkBtn(bar2, "Delete all", 0, 88, THEME.ERR, doDeleteAll)
+
+	local waitLab = Instance.new("TextLabel")
+	waitLab.BackgroundTransparency = 1
+	waitLab.Position = UDim2.fromOffset(96, 0)
+	waitLab.Size = UDim2.fromOffset(32, 32)
+	waitLab.Font = Enum.Font.Gotham
+	waitLab.TextSize = 11
+	waitLab.TextXAlignment = Enum.TextXAlignment.Right
+	waitLab.TextColor3 = THEME.DIM
+	waitLab.Text = "wait"
+	waitLab.Parent = bar2
+
+	waitAllBox = Instance.new("TextBox")
+	waitAllBox.Size = UDim2.fromOffset(44, 32)
+	waitAllBox.Position = UDim2.fromOffset(132, 0)
+	waitAllBox.BackgroundColor3 = THEME.PANEL
+	waitAllBox.BorderSizePixel = 0
+	waitAllBox.Font = Enum.Font.GothamMedium
+	waitAllBox.TextSize = 13
+	waitAllBox.TextColor3 = THEME.TEXT
+	waitAllBox.Text = "0.10"
+	waitAllBox.ClearTextOnFocus = false
+	waitAllBox.Parent = bar2
+	corner(waitAllBox, 8)
+
+	mkBtn(bar2, "Set waits", 184, 80, THEME.BTN, doSetWaits)
+
+	local hint = Instance.new("TextLabel")
+	hint.BackgroundTransparency = 1
+	hint.Position = UDim2.fromOffset(272, 0)
+	hint.Size = UDim2.new(1, -272, 1, 0)
+	hint.Font = Enum.Font.Gotham
+	hint.TextSize = 11
+	hint.TextXAlignment = Enum.TextXAlignment.Left
+	hint.TextColor3 = THEME.DIM
+	hint.Text = "  Click a type. Ctrl+click more. Delete all removes every match."
+	hint.Parent = bar2
+
 	local listHold = Instance.new("Frame")
-	listHold.Position = UDim2.fromOffset(12, 96)
-	listHold.Size = UDim2.new(0, 280, 1, -148)
+	listHold.Position = UDim2.fromOffset(12, 128)
+	listHold.Size = UDim2.new(0, 280, 1, -180)
 	listHold.BackgroundColor3 = THEME.PANEL
 	listHold.BorderSizePixel = 0
 	listHold.Parent = win
@@ -1203,8 +1418,8 @@ local function createGui()
 	lay.Parent = listFrame
 
 	local noteHold = Instance.new("Frame")
-	noteHold.Position = UDim2.fromOffset(300, 96)
-	noteHold.Size = UDim2.new(1, -312, 1, -148)
+	noteHold.Position = UDim2.fromOffset(300, 128)
+	noteHold.Size = UDim2.new(1, -312, 1, -180)
 	noteHold.BackgroundColor3 = THEME.PANEL
 	noteHold.BorderSizePixel = 0
 	noteHold.Parent = win
@@ -1313,7 +1528,7 @@ local function createGui()
 	logLabel.TextXAlignment = Enum.TextXAlignment.Left
 	logLabel.TextColor3 = THEME.DIM
 	logLabel.TextWrapped = true
-	logLabel.Text = "  Green = outbound, purple = inbound. Clock/live-time spam is ignored. Drag corner to resize."
+	logLabel.Text = "  Click a type, Ctrl+click more, Delete all. Set waits changes every wait(). F10 closes."
 	logLabel.Parent = win
 	corner(logLabel, 6)
 
